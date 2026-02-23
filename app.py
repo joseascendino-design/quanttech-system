@@ -1091,11 +1091,13 @@ def scanner_route():
         if not tickers:
             return jsonify({'erro': 'Nenhum ticker informado'}), 400
 
+        import time
         resultados = []
         for ticker in tickers[:15]:  # max 15 ações
             try:
                 ticker_yf = ticker if '.SA' in ticker else f'{ticker}.SA'
                 periodo = '2y' if timeframe == '1d' else '5y'
+                time.sleep(0.5)  # evita rate limit do Yahoo Finance
                 df = yf.Ticker(ticker_yf).history(period=periodo, interval=timeframe)
                 if df.empty or len(df) < 60:
                     resultados.append({'ticker': ticker, 'erro': 'Dados insuficientes'})
