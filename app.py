@@ -1104,12 +1104,23 @@ def scanner_route():
                 ema9  = close.ewm(span=9,  adjust=False).mean()
                 ema50 = close.ewm(span=50, adjust=False).mean()
 
-                # Sinal atual (último candle)
+                # Sinal atual — verifica candle atual e 2 anteriores (como TradingView)
                 sinal_ativo = False
-                if len(ema9) >= 3:
-                    ema9_virou_cima      = (ema9.iloc[-1] > ema9.iloc[-2]) and (ema9.iloc[-2] < ema9.iloc[-3]) and (ema9.iloc[-1] > ema50.iloc[-1])
-                    ema50_inclinada_cima = ema50.iloc[-1] > ema50.iloc[-2]
-                    sinal_ativo = bool(ema9_virou_cima and ema50_inclinada_cima)
+                sinal_candle = 0
+                if len(ema9) >= 5:
+                    for lookback in [0, 1, 2]:
+                        idx = -(1 + lookback)
+                        e9_now   = ema9.iloc[idx]
+                        e9_prev  = ema9.iloc[idx - 1]
+                        e9_prev2 = ema9.iloc[idx - 2]
+                        e50_now  = ema50.iloc[idx]
+                        e50_prev = ema50.iloc[idx - 1]
+                        virou  = (e9_now > e9_prev) and (e9_prev < e9_prev2) and (e9_now > e50_now)
+                        inclin = e50_now > e50_prev
+                        if virou and inclin:
+                            sinal_ativo  = True
+                            sinal_candle = lookback
+                            break
 
                 # Backtesting da estratégia
                 trades = []
@@ -1168,6 +1179,7 @@ def scanner_route():
                 resultados.append({
                     'ticker':         ticker,
                     'sinal':          sinal_ativo,
+                    'sinal_candle':   sinal_candle if sinal_ativo else -1,
                     'cotacao':        round(float(close.iloc[-1]), 2),
                     'ema9':           round(float(ema9.iloc[-1]), 2),
                     'ema50':          round(float(ema50.iloc[-1]), 2),
@@ -1525,7 +1537,8 @@ function renderResultados(resultados) {
       const cs = r.sinal ? 'com-sinal' : 'sem-sinal';
       const ct = r.sinal ? 'sinal' : 'no-sinal';
       const bt = r.sinal ? 'sinal' : 'no-sinal';
-      const bl = r.sinal ? '✅ SINAL ATIVO' : '⏳ SEM SINAL';
+      const quando = r.sinal_candle === 0 ? 'HOJE' : r.sinal_candle === 1 ? 'ONTEM' : '2 DIAS ATRÁS';
+      const bl = r.sinal ? `✅ SINAL — ${quando}` : '⏳ SEM SINAL';
       const lp_c = r.lp_total >= 0 ? '#00ff88' : '#ff4455';
       const pf_c = r.profit_factor >= 1.5 ? '#00ff88' : (r.profit_factor >= 1 ? '#ffd700' : '#ff4455');
       const wr_c = r.win_rate >= 50 ? '#00ff88' : (r.win_rate >= 30 ? '#ffd700' : '#ff4455');
