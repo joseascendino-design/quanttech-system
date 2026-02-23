@@ -106,14 +106,13 @@ def buscar_dados_fundamentus(ticker):
 
         # defaultKeyStatistics
         ks = res.get('defaultKeyStatistics') or {}
-        pl             = ks.get('trailingPE') or res.get('priceEarnings')
+        pl             = res.get('priceEarnings') or ks.get('trailingPE')
         pvp            = ks.get('priceToBook')
         lpa            = ks.get('trailingEps') or ks.get('forwardEps')
         vpa            = ks.get('bookValue')
         ev             = ks.get('enterpriseValue')
         ev_ebitda      = ks.get('enterpriseToEbitda')
         ev_ebit        = ks.get('enterpriseToRevenue')
-        psr            = res.get('priceToSalesTrailing12Months') or ks.get('priceToSalesTrailing12Months')
 
         # financialData
         fd = res.get('financialData') or {}
@@ -128,20 +127,28 @@ def buscar_dados_fundamentus(ticker):
         caixa          = fd.get('totalCash')
         receita        = fd.get('totalRevenue')
         divida_liquida = (divida_total - caixa) if divida_total and caixa else None
-        dy             = pct(res.get('dividendYield') or fd.get('dividendYield'))
         liq_corrente   = fd.get('currentRatio')
         divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
 
-        # Dívida bruta / patrimônio
+        # Div. Yield — vem direto no resultado principal
+        dy_raw = res.get('dividendYield')
+        dy = round(dy_raw, 2) if dy_raw and dy_raw > 1 else pct(dy_raw) if dy_raw else None
+
+        # PSR — preço / receita por ação
+        psr = None
+        if cotacao and receita and valor_mercado and valor_mercado > 0:
+            psr = round((valor_mercado / receita), 2)
+
+        # Dívida bruta / patrimônio — debtToEquity já em decimal na Brapi
         divida_bruta_patrim = fd.get('debtToEquity')
-        if divida_bruta_patrim:
-            divida_bruta_patrim = divida_bruta_patrim / 100  # Brapi retorna em %, converter
+        if divida_bruta_patrim and divida_bruta_patrim > 10:
+            divida_bruta_patrim = divida_bruta_patrim / 100  # alguns casos vem em %
 
         # Giro ativos
         giro_ativos = None
         total_assets = fd.get('totalAssets') or ks.get('totalAssets')
         if receita and total_assets and total_assets > 0:
-            giro_ativos = receita / total_assets
+            giro_ativos = round(receita / total_assets, 2)
 
         # EBIT/Ativo
         ebit_ativo = None
@@ -151,12 +158,18 @@ def buscar_dados_fundamentus(ticker):
         # P/EBIT
         p_ebit = None
         if cotacao and ebitda and valor_mercado and ebitda > 0:
-            ebit_por_acao = ebitda / (valor_mercado / cotacao) if valor_mercado and cotacao else None
-            if ebit_por_acao and ebit_por_acao > 0:
-                p_ebit = cotacao / ebit_por_acao
+            acoes = valor_mercado / cotacao
+            if acoes > 0:
+                ebit_por_acao = ebitda / acoes
+                if ebit_por_acao > 0:
+                    p_ebit = round(cotacao / ebit_por_acao, 1)
 
-        # Crescimento receita
-        crescimento_receita = pct(fd.get('revenueGrowth') or fd.get('earningsGrowth'))
+        # Crescimento receita — revenueGrowth é YoY, não 5 anos
+        # Usar earningsGrowth como proxy mais estável
+        crescimento_receita = None
+        rg = fd.get('revenueGrowth')
+        if rg is not None and abs(rg) < 5:  # evitar valores absurdos
+            crescimento_receita = pct(rg)
 
         # Valor firma
         valor_firma = ev
