@@ -72,18 +72,25 @@ def limpar_valor(valor_texto):
 def buscar_dados_fundamentus(ticker):
     ticker_limpo = ticker.replace('.SA', '')
     url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker_limpo}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+    }
     try:
         response = requests.get(url, headers=headers, timeout=15)
+        response.encoding = 'utf-8'
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         tables = soup.find_all('table')
         if not tables:
             return None
+
         dados = {
             'ticker': ticker_limpo, 'nome': None, 'setor': None, 'subsetor': None,
             'cotacao': None, 'pl': None, 'pvp': None, 'psr': None, 'p_ebit': None,
-            'p_ativo': None, 'p_cap_giro': None, 'p_ativ_circ': None,
             'ev_ebitda': None, 'ev_ebit': None, 'lpa': None, 'vpa': None,
             'roe': None, 'roic': None, 'ebit_ativo': None,
             'margem_bruta': None, 'margem_ebit': None, 'margem_liquida': None,
@@ -93,33 +100,80 @@ def buscar_dados_fundamentus(ticker):
             'valor_mercado': None, 'valor_firma': None, 'lucro_liquido': None,
             'oscilacoes': {}
         }
+
+        # Extrair todos os pares label→valor das tabelas
+        pares = {}
         all_cells = []
         for table in tables:
-            rows = table.find_all('tr')
-            for row in rows:
+            for row in table.find_all('tr'):
                 cells = row.find_all(['td', 'th'])
-                all_cells.extend([c.get_text(strip=True) for c in cells])
+                textos = [c.get_text(strip=True) for c in cells]
+                all_cells.extend(textos)
+                # Pares consecutivos label→valor
+                for i in range(0, len(textos) - 1, 2):
+                    if textos[i]:
+                        pares[textos[i]] = textos[i+1] if i+1 < len(textos) else ''
+                # Também mapear posição impar
+                for i in range(len(textos)-1):
+                    if textos[i]:
+                        pares[textos[i]] = textos[i+1]
 
-        def get_after(label):
-            for i, c in enumerate(all_cells):
-                if label.lower() in c.lower() and i + 1 < len(all_cells):
-                    return all_cells[i + 1]
+        def buscar(labels):
+            """Busca valor por múltiplos labels possíveis, insensível a acento/case"""
+            import unicodedata
+            def norm(s):
+                return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
+            for label in labels:
+                nl = norm(label)
+                for k, v in pares.items():
+                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
+                        return limpar_valor(v)
+                # Busca parcial
+                for k, v in pares.items():
+                    if nl in norm(k) and v and v.strip() not in ['-','','N/A','--']:
+                        return limpar_valor(v)
             return None
 
-        # Nome e cabeçalho
-        try:
-            header_table = tables[0]
-            header_cells = header_table.find_all('td')
-            if len(header_cells) >= 2:
-                dados['nome'] = header_cells[1].get_text(strip=True)
-        except:
-            pass
+        def buscar_raw(labels):
+            """Retorna texto bruto sem limpar"""
+            import unicodedata
+            def norm(s):
+                return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
+            for label in labels:
+                nl = norm(label)
+                for k, v in pares.items():
+                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
+                        return v.strip()
+            return None
 
-        # Scraping estruturado por label
+        # Nome da empresa
+        try:
+            for table in tables:
+                cells = table.find_all('td')
+                for i, c in enumerate(cells):
+                    if ticker_limpo.upper() in c.get_text(strip=True).upper() and i+1 < len(cells):
+                        nome_candidato = cells[i+1].get_text(strip=True)
+                        if len(nome_candidato) > 3:
+                            dados['nome'] = nome_candidato
+                            break
+                if dados['nome']:
+                    break
+            if not dados['nome'] and len(all_cells) > 2:
+                dados['nome'] = all_cells[1] if len(all_cells[1]) > 3 else all_cells[2]
+        except: pass
+
+        # Setor/Subsetor
+        for i, c in enumerate(all_cells):
+            if c in ['Setor', 'Setor:'] and i+1 < len(all_cells):
+                dados['setor'] = all_cells[i+1]
+            if c in ['Subsetor', 'Subsetor:'] and i+1 < len(all_cells):
+                dados['subsetor'] = all_cells[i+1]
+
+        # Mapeamento robusto com múltiplos labels por campo
         mapa = {
-            'cotacao':               ['Cotação', 'Cot.'],
-            'pl':                    ['P/L'],
-            'pvp':                   ['P/VP'],
+            'cotacao':               ['Cotacao', 'Cot.', 'Cotação'],
+            'pl':                    ['P/L', 'P/L '],
+            'pvp':                   ['P/VP', 'P/VP '],
             'psr':                   ['PSR'],
             'p_ebit':                ['P/EBIT'],
             'ev_ebitda':             ['EV/EBITDA'],
@@ -128,64 +182,56 @@ def buscar_dados_fundamentus(ticker):
             'vpa':                   ['VPA'],
             'roe':                   ['ROE'],
             'roic':                  ['ROIC'],
-            'ebit_ativo':            ['EBIT / Ativo'],
-            'margem_bruta':          ['Marg. Bruta'],
-            'margem_ebit':           ['Marg. EBIT'],
-            'margem_liquida':        ['Marg. Líquida'],
-            'divida_bruta_patrim':   ['Dív. Bruta/ Patrim.'],
-            'divida_liquida_ebitda': ['Dív. Líq./EBITDA'],
-            'divida_liquida_pl':     ['Dív. Líq./Patrim.'],
-            'liquidez_corrente':     ['Liquidez Corr.'],
-            'giro_ativos':           ['Giro Ativos'],
-            'crescimento_receita':   ['Cresc. Rec.5a'],
-            'div_yield':             ['Div. Yield'],
+            'ebit_ativo':            ['EBIT / Ativo', 'EBIT/Ativo', 'EBIT / Ativo '],
+            'margem_bruta':          ['Marg. Bruta', 'Margem Bruta', 'Marg Bruta'],
+            'margem_ebit':           ['Marg. EBIT', 'Margem EBIT', 'Marg EBIT'],
+            'margem_liquida':        ['Marg. Liquida', 'Margem Liquida', 'Marg. Líquida', 'Margem Líquida'],
+            'divida_bruta_patrim':   ['Div. Bruta/ Patrim.', 'Div. Bruta/Patrim.', 'Div Bruta/ Patrim', 'Divida Bruta/ Patrim'],
+            'divida_liquida_ebitda': ['Div. Liq./EBITDA', 'Div. Líq./EBITDA', 'Divida Liq./EBITDA'],
+            'divida_liquida_pl':     ['Div. Liq./Patrim.', 'Div. Líq./Patrim.', 'Divida Liq./Patrim'],
+            'liquidez_corrente':     ['Liquidez Corr.', 'Liquidez Corrente', 'Liq. Corrente'],
+            'giro_ativos':           ['Giro Ativos', 'Giro dos Ativos'],
+            'crescimento_receita':   ['Cresc. Rec.5a', 'Cresc. Rec. 5a', 'Cresc Rec 5a', 'Crescimento Rec 5a', 'Cresc. Rec.5anos'],
+            'div_yield':             ['Div. Yield', 'Dividend Yield', 'DY'],
         }
+
         for campo, labels in mapa.items():
-            for label in labels:
-                val = get_after(label)
-                if val:
-                    dados[campo] = limpar_valor(val)
-                    break
+            val = buscar(labels)
+            if val is not None:
+                dados[campo] = val
 
-        # Valores absolutos
+        # Valores absolutos (busca por texto parcial)
         for i, c in enumerate(all_cells):
-            if 'Valor de mercado' in c and i+1 < len(all_cells):
-                try:
-                    v = all_cells[i+1].replace('.','').replace(',','.').strip()
-                    dados['valor_mercado'] = float(v)
+            cl = c.lower()
+            if 'valor de mercado' in cl and i+1 < len(all_cells):
+                try: dados['valor_mercado'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
                 except: pass
-            if 'Valor da firma' in c and i+1 < len(all_cells):
-                try:
-                    v = all_cells[i+1].replace('.','').replace(',','.').strip()
-                    dados['valor_firma'] = float(v)
+            if 'valor da firma' in cl and i+1 < len(all_cells):
+                try: dados['valor_firma'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
                 except: pass
-            if 'Lucro Líquido' in c and i+1 < len(all_cells):
-                try:
-                    v = all_cells[i+1].replace('.','').replace(',','.').strip()
-                    dados['lucro_liquido'] = float(v)
+            if 'lucro l' in cl and 'quido' in cl and i+1 < len(all_cells):
+                try: dados['lucro_liquido'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
                 except: pass
-
-        # Setor/Subsetor
-        for i, c in enumerate(all_cells):
-            if c == 'Setor' and i+1 < len(all_cells):
-                dados['setor'] = all_cells[i+1]
-            if c == 'Subsetor' and i+1 < len(all_cells):
-                dados['subsetor'] = all_cells[i+1]
 
         # Oscilações
-        osc_map = {
-            'dia': 'Dia', 'mes': 'Mês', '30_dias': '30 dias',
-            '12_meses': '12 meses', '2026': '2026', '2025': '2025',
-            '2024': '2024', '2023': '2023', '2022': '2022'
+        osc_labels = {
+            'dia':      ['Dia', '1 Dia'],
+            'mes':      ['Mes', 'Mês', '1 Mes', '1 Mês'],
+            '30_dias':  ['30 dias', '30 Dias'],
+            '12_meses': ['12 meses', '12 Meses'],
+            '2026':     ['2026'], '2025': ['2025'],
+            '2024':     ['2024'], '2023': ['2023'], '2022': ['2022'],
         }
-        for chave, label in osc_map.items():
-            val = get_after(label)
-            if val:
-                dados['oscilacoes'][chave] = limpar_valor(val)
+        for chave, labels in osc_labels.items():
+            val = buscar(labels)
+            if val is not None:
+                dados['oscilacoes'][chave] = val
 
         return dados if dados['cotacao'] else None
+
     except Exception as e:
         print(f"[ERRO] buscar_dados_fundamentus: {e}")
+        traceback.print_exc()
         return None
 
 def calcular_score_consolidado(dados):
