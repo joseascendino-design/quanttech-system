@@ -69,32 +69,121 @@ def limpar_valor(valor_texto):
     except:
         return None
 
+BRAPI_TOKEN = 'sDvXn4oPrWRmmZzgTo4wgC'
+
 def buscar_dados_fundamentus(ticker):
-    ticker_limpo = ticker.replace('.SA', '')
-    url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker_limpo}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://www.fundamentus.com.br/',
-    }
-    session = requests.Session()
-    session.headers.update(headers)
+    ticker_limpo = ticker.replace('.SA', '').upper()
     try:
-        # Primeiro acessa a página principal para pegar cookies
+        # Buscar cotação + indicadores fundamentalistas via Brapi
+        url_quote = f"https://brapi.dev/api/quote/{ticker_limpo}?modules=summaryProfile,defaultKeyStatistics,financialData,balanceSheetHistory,incomeStatementHistory&token={BRAPI_TOKEN}"
+        r = requests.get(url_quote, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+
+        if not j.get('results'):
+            return None
+
+        res = j['results'][0]
+
+        def g(d, *keys):
+            """Pega valor aninhado com segurança"""
+            for k in keys:
+                if isinstance(d, dict):
+                    d = d.get(k)
+                else:
+                    return None
+            return d
+
+        def pct(v):
+            """Converte decimal para percentual se necessário"""
+            if v is None: return None
+            return v * 100 if abs(v) < 5 else v
+
+        cotacao        = g(res, 'regularMarketPrice')
+        pl             = g(res, 'priceToEarningsRatio') or g(res, 'trailingPE')
+        pvp            = g(res, 'priceToBookRatio') or g(res, 'priceToBook')
+        lpa            = g(res, 'eps') or g(res, 'epsTrailingTwelveMonths')
+        dy             = pct(g(res, 'dividendYield'))
+        valor_mercado  = g(res, 'marketCap')
+        nome           = g(res, 'longName') or g(res, 'shortName') or ticker_limpo
+        setor          = g(res, 'sector')
+        subsetor       = g(res, 'industry')
+
+        # Indicadores financeiros
+        fd = res.get('financialData') or {}
+        roe            = pct(g(fd, 'returnOnEquity'))
+        roic           = pct(g(fd, 'returnOnAssets'))  # aproximação
+        margem_bruta   = pct(g(fd, 'grossMargins'))
+        margem_ebit    = pct(g(fd, 'operatingMargins') or g(fd, 'ebitdaMargins'))
+        margem_liquida = pct(g(fd, 'profitMargins'))
+        receita        = g(fd, 'totalRevenue')
+        ebitda         = g(fd, 'ebitda')
+        lucro_liquido  = g(fd, 'netIncomeToCommon') or g(fd, 'freeCashflow')
+        divida_total   = g(fd, 'totalDebt')
+        caixa          = g(fd, 'totalCash')
+        divida_liquida = (divida_total - caixa) if divida_total and caixa else None
+
+        ks = res.get('defaultKeyStatistics') or {}
+        vpa            = g(ks, 'bookValue')
+        ev             = g(ks, 'enterpriseValue')
+        psr            = g(ks, 'priceToSalesTrailing12Months')
+        ev_ebitda      = (ev / ebitda) if ev and ebitda and ebitda > 0 else None
+        divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
+        divida_bruta_patrim = None
+        if divida_total and vpa and valor_mercado:
+            patrim = vpa * (valor_mercado / cotacao) if cotacao else None
+            if patrim and patrim > 0:
+                divida_bruta_patrim = divida_total / patrim
+
+        # Crescimento receita (via histórico se disponível)
+        crescimento_receita = None
         try:
-            session.get('https://www.fundamentus.com.br/', timeout=10)
+            inc = res.get('incomeStatementHistory', {}).get('incomeStatementHistory', [])
+            if len(inc) >= 2:
+                r_new = inc[0].get('totalRevenue', {}).get('raw', 0)
+                r_old = inc[-1].get('totalRevenue', {}).get('raw', 0)
+                if r_old and r_old > 0 and r_new:
+                    anos = len(inc) - 1
+                    crescimento_receita = ((r_new / r_old) ** (1/anos) - 1) * 100
         except: pass
-        response = session.get(url, timeout=20)
-        response.encoding = 'utf-8'
-        response.raise_for_status()
+
+        # Oscilações via Brapi
+        oscilacoes = {}
+        try:
+            url_osc = f"https://brapi.dev/api/quote/{ticker_limpo}?range=1y&interval=1d&token={BRAPI_TOKEN}"
+            ro = requests.get(url_osc, timeout=15)
+            hist_data = ro.json().get('results', [{}])[0].get('historicalDataPrice', [])
+            if hist_data and len(hist_data) > 1:
+                p_hoje = hist_data[-1].get('close', 0)
+                p_ontem = hist_data[-2].get('close', 0) if len(hist_data) > 1 else 0
+                p_30d   = hist_data[-22].get('close', 0) if len(hist_data) > 22 else 0
+                p_12m   = hist_data[0].get('close', 0)
+                if p_ontem and p_hoje: oscilacoes['dia']     = ((p_hoje/p_ontem)-1)*100
+                if p_30d   and p_hoje: oscilacoes['30_dias'] = ((p_hoje/p_30d)-1)*100
+                if p_12m   and p_hoje: oscilacoes['12_meses']= ((p_hoje/p_12m)-1)*100
+        except: pass
+
+        # Valor firma
+        valor_firma = ev
+
+        dados = {
+            'ticker': ticker_limpo, 'nome': nome, 'setor': setor, 'subsetor': subsetor,
+            'cotacao': cotacao, 'pl': pl, 'pvp': pvp, 'psr': psr, 'p_ebit': None,
+            'ev_ebitda': ev_ebitda, 'ev_ebit': None, 'lpa': lpa, 'vpa': vpa,
+            'roe': roe, 'roic': roic, 'ebit_ativo': None,
+            'margem_bruta': margem_bruta, 'margem_ebit': margem_ebit, 'margem_liquida': margem_liquida,
+            'divida_bruta_patrim': divida_bruta_patrim, 'divida_liquida_pl': None,
+            'divida_liquida_ebitda': divida_liq_ebitda, 'liquidez_corrente': None,
+            'giro_ativos': None, 'crescimento_receita': crescimento_receita, 'div_yield': dy,
+            'valor_mercado': valor_mercado, 'valor_firma': valor_firma, 'lucro_liquido': lucro_liquido,
+            'oscilacoes': oscilacoes
+        }
+        return dados if cotacao else None
+
+    except Exception as e:
+        print(f"[ERRO] buscar_dados_fundamentus: {e}")
+        traceback.print_exc()
+        return None
         soup = BeautifulSoup(response.text, 'html.parser')
         tables = soup.find_all('table')
         if not tables:
