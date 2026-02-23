@@ -760,6 +760,7 @@ def gerar_html_relatorio(ticker, dados, scores, insights, sim,
       <button onclick="buscarTicker()">ANALISAR</button>
     </div>
     <div id="search-status"></div>
+    <nav style="display:flex;gap:6px;"><a href="/" style="color:var(--muted);text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;border:1px solid var(--border);font-family:Syne,sans-serif;font-weight:700;letter-spacing:1px;">ANÁLISE</a><a href="/estrategias" style="color:#000;text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;background:var(--cyan);border:1px solid var(--cyan);font-family:Syne,sans-serif;font-weight:700;letter-spacing:1px;">ESTRATÉGIAS</a></nav>
   </div>
 </div>
 <div class="container">
