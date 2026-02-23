@@ -1069,6 +1069,520 @@ def simular_route():
         return jsonify({'erro': str(e)}), 500
 
 
+@app.route('/estrategias')
+def estrategias_route():
+    return Response(PAGINA_ESTRATEGIAS, mimetype='text/html; charset=utf-8')
+
+
+@app.route('/scanner', methods=['POST'])
+def scanner_route():
+    """Roda o scanner da estratégia EMA 9.1 nas ações enviadas"""
+    try:
+        data = request.get_json()
+        tickers   = [t.strip().upper() for t in data.get('tickers', []) if t.strip()]
+        tp_pct    = float(data.get('tp', 5.0))
+        sl_pct    = float(data.get('sl', 2.0))
+        timeframe = data.get('timeframe', '1d')
+
+        if not tickers:
+            return jsonify({'erro': 'Nenhum ticker informado'}), 400
+
+        resultados = []
+        for ticker in tickers[:15]:  # max 15 ações
+            try:
+                ticker_yf = ticker if '.SA' in ticker else f'{ticker}.SA'
+                periodo = '2y' if timeframe == '1d' else '5y'
+                df = yf.Ticker(ticker_yf).history(period=periodo, interval=timeframe)
+                if df.empty or len(df) < 60:
+                    resultados.append({'ticker': ticker, 'erro': 'Dados insuficientes'})
+                    continue
+
+                close = df['Close']
+                low   = df['Low']
+
+                ema9  = close.ewm(span=9,  adjust=False).mean()
+                ema50 = close.ewm(span=50, adjust=False).mean()
+
+                # Sinal atual (último candle)
+                sinal_ativo = False
+                if len(ema9) >= 3:
+                    ema9_virou_cima      = (ema9.iloc[-1] > ema9.iloc[-2]) and (ema9.iloc[-2] < ema9.iloc[-3]) and (ema9.iloc[-1] > ema50.iloc[-1])
+                    ema50_inclinada_cima = ema50.iloc[-1] > ema50.iloc[-2]
+                    sinal_ativo = bool(ema9_virou_cima and ema50_inclinada_cima)
+
+                # Backtesting da estratégia
+                trades = []
+                em_posicao = False
+                preco_entrada = 0.0
+                stop_nivel = 0.0
+                candle_entrada = 0
+
+                for i in range(3, len(df)):
+                    c     = close.iloc[i]
+                    e9    = ema9.iloc[i];  e9_1 = ema9.iloc[i-1];  e9_2 = ema9.iloc[i-2]
+                    e50   = ema50.iloc[i]; e50_1 = ema50.iloc[i-1]
+                    lo    = low.iloc[i]
+
+                    if not em_posicao:
+                        cond = (e9 > e9_1) and (e9_1 < e9_2) and (e9 > e50) and (e50 > e50_1)
+                        if cond:
+                            preco_entrada  = c
+                            stop_nivel     = lo * (1 - sl_pct / 100)
+                            tp_nivel       = c * (1 + tp_pct / 100)
+                            em_posicao     = True
+                            candle_entrada = i
+                    else:
+                        # Atualiza stop dinâmico
+                        if c < e50 and i > candle_entrada:
+                            stop_nivel = min(stop_nivel, lo * (1 - sl_pct / 100))
+                        # Saída por TP
+                        if c >= tp_nivel:
+                            trades.append({'resultado': 'win', 'retorno': (tp_nivel - preco_entrada) / preco_entrada * 100})
+                            em_posicao = False
+                        # Saída por SL
+                        elif lo <= stop_nivel:
+                            trades.append({'resultado': 'loss', 'retorno': (stop_nivel - preco_entrada) / preco_entrada * 100})
+                            em_posicao = False
+
+                # Métricas
+                total     = len(trades)
+                wins      = sum(1 for t in trades if t['resultado'] == 'win')
+                losses    = total - wins
+                win_rate  = (wins / total * 100) if total > 0 else 0
+                gross_profit = sum(t['retorno'] for t in trades if t['resultado'] == 'win')
+                gross_loss   = abs(sum(t['retorno'] for t in trades if t['resultado'] == 'loss'))
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0)
+                lp_total  = sum(t['retorno'] for t in trades)
+
+                # Drawdown máximo simples
+                capital = 100.0
+                peak = 100.0
+                max_dd = 0.0
+                for t in trades:
+                    capital *= (1 + t['retorno'] / 100)
+                    if capital > peak: peak = capital
+                    dd = (peak - capital) / peak * 100
+                    if dd > max_dd: max_dd = dd
+
+                resultados.append({
+                    'ticker':         ticker,
+                    'sinal':          sinal_ativo,
+                    'cotacao':        round(float(close.iloc[-1]), 2),
+                    'ema9':           round(float(ema9.iloc[-1]), 2),
+                    'ema50':          round(float(ema50.iloc[-1]), 2),
+                    'total_trades':   total,
+                    'win_rate':       round(win_rate, 1),
+                    'wins':           wins,
+                    'losses':         losses,
+                    'profit_factor':  round(profit_factor, 3),
+                    'lp_total':       round(lp_total, 2),
+                    'max_dd':         round(max_dd, 1),
+                    'aprovada':       profit_factor > 1.5 and max_dd < 30 and win_rate > 30 and total >= 18,
+                })
+            except Exception as e:
+                resultados.append({'ticker': ticker, 'erro': str(e)})
+
+        return jsonify({'ok': True, 'resultados': resultados})
+    except Exception as e:
+        return jsonify({'erro': str(e)}), 500
+
+
+PAGINA_ESTRATEGIAS = '''<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚛️ QUANTTECH — Estratégias</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
+  :root{--bg:#0a0c10;--bg2:#111318;--bg3:#1a1d24;--border:#2a2d36;
+    --green:#00ff88;--red:#ff4455;--yellow:#ffd700;--cyan:#00e5ff;--text:#e8eaf0;--muted:#6b7280;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;min-height:100vh;}
+  /* HEADER */
+  .header{background:linear-gradient(135deg,#0d1117,#111827);border-bottom:1px solid var(--border);
+    padding:8px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+    position:sticky;top:0;z-index:100;}
+  .brand{display:flex;align-items:center;gap:10px;}
+  .brand-name{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--cyan);letter-spacing:3px;}
+  .brand-sub{font-size:0.5rem;color:var(--muted);letter-spacing:2px;}
+  .nav{display:flex;gap:6px;}
+  .nav a{color:var(--muted);text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;
+    border:1px solid var(--border);transition:all 0.2s;font-family:'Syne',sans-serif;font-weight:700;letter-spacing:1px;}
+  .nav a:hover{color:var(--cyan);border-color:var(--cyan);}
+  .nav a.active{color:#000;background:var(--cyan);border-color:var(--cyan);}
+  /* MAIN */
+  .container{max-width:1200px;margin:0 auto;padding:20px;}
+  .page-title{font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:800;color:var(--cyan);
+    letter-spacing:3px;margin-bottom:4px;}
+  .page-sub{font-size:0.6rem;color:var(--muted);letter-spacing:2px;margin-bottom:24px;}
+  /* STRATEGY CARD */
+  .strat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:24px;}
+  .strat-card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;
+    cursor:pointer;transition:all 0.2s;position:relative;overflow:hidden;}
+  .strat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cyan),var(--green));}
+  .strat-card:hover{border-color:var(--cyan);transform:translateY(-2px);}
+  .strat-card.selected{border-color:var(--cyan);background:#0d1a1f;}
+  .strat-name{font-family:'Syne',sans-serif;font-size:0.9rem;font-weight:800;color:var(--cyan);margin-bottom:4px;}
+  .strat-desc{font-size:0.62rem;color:var(--muted);line-height:1.6;margin-bottom:10px;}
+  .strat-tags{display:flex;gap:5px;flex-wrap:wrap;}
+  .strat-tag{background:var(--bg3);border:1px solid var(--border);border-radius:3px;
+    padding:2px 7px;font-size:0.55rem;color:var(--cyan);}
+  /* CONFIG PANEL */
+  .config-panel{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:16px;margin-bottom:20px;display:none;}
+  .config-panel.visible{display:block;}
+  .config-title{font-family:'Syne',sans-serif;font-size:0.7rem;font-weight:700;
+    color:var(--muted);letter-spacing:2px;margin-bottom:14px;text-transform:uppercase;}
+  .config-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:16px;}
+  .config-field{display:flex;flex-direction:column;gap:4px;}
+  .config-label{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}
+  .config-input{background:var(--bg3);border:1px solid var(--border);color:var(--text);
+    border-radius:5px;padding:7px 10px;font-family:'JetBrains Mono',monospace;font-size:0.75rem;outline:none;
+    transition:border 0.2s;}
+  .config-input:focus{border-color:var(--cyan);}
+  select.config-input option{background:var(--bg3);}
+  /* TICKERS */
+  .tickers-section{margin-bottom:16px;}
+  .tickers-label{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}
+  .tickers-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;min-height:36px;
+    background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:6px;}
+  .ticker-chip{background:#1a2a1a;border:1px solid var(--green);border-radius:4px;
+    padding:3px 8px;font-size:0.65rem;color:var(--green);display:flex;align-items:center;gap:5px;cursor:default;}
+  .ticker-chip span{cursor:pointer;color:var(--muted);font-size:0.7rem;} .ticker-chip span:hover{color:var(--red);}
+  .ticker-add{display:flex;gap:6px;}
+  .ticker-add input{background:var(--bg3);border:1px solid var(--border);color:var(--text);
+    border-radius:5px;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:0.75rem;
+    outline:none;width:110px;text-transform:uppercase;}
+  .ticker-add input:focus{border-color:var(--cyan);}
+  .ticker-add button{background:var(--bg3);color:var(--cyan);border:1px solid var(--cyan);
+    border-radius:5px;padding:6px 12px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.65rem;}
+  .ticker-add button:hover{background:var(--cyan);color:#000;}
+  /* BTN SCANNER */
+  .btn-scanner{background:linear-gradient(135deg,var(--cyan),#0099aa);color:#000;border:none;
+    border-radius:7px;padding:12px 32px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:800;
+    font-size:0.85rem;letter-spacing:2px;transition:all 0.2s;width:100%;}
+  .btn-scanner:hover{opacity:0.9;transform:translateY(-1px);}
+  .btn-scanner:disabled{opacity:0.5;cursor:not-allowed;transform:none;}
+  /* PROGRESS */
+  .progress-wrap{display:none;margin-top:12px;text-align:center;}
+  .progress-wrap.visible{display:block;}
+  .progress-bar{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin:8px 0;}
+  .progress-fill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));
+    border-radius:2px;width:0%;transition:width 0.3s;}
+  .progress-txt{font-size:0.65rem;color:var(--cyan);}
+  /* RESULTS */
+  .results-section{display:none;margin-top:24px;}
+  .results-section.visible{display:block;}
+  .results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;}
+  .results-title{font-family:'Syne',sans-serif;font-size:0.85rem;font-weight:800;color:var(--text);letter-spacing:2px;}
+  .results-summary{display:flex;gap:10px;flex-wrap:wrap;}
+  .sum-badge{padding:4px 10px;border-radius:4px;font-size:0.62rem;font-weight:700;font-family:'Syne',sans-serif;}
+  .sum-badge.sinal{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.3);}
+  .sum-badge.sem-sinal{background:rgba(255,68,85,0.1);color:var(--red);border:1px solid rgba(255,68,85,0.2);}
+  /* RESULT CARDS */
+  .result-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;}
+  .result-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px;
+    position:relative;overflow:hidden;transition:border 0.2s;}
+  .result-card.com-sinal{border-color:rgba(0,255,136,0.4);background:linear-gradient(135deg,#0d1a12,var(--bg2));}
+  .result-card.sem-sinal{opacity:0.7;}
+  .result-card.com-sinal::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--green);}
+  .rc-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+  .rc-ticker{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;}
+  .rc-ticker.sinal{color:var(--green);} .rc-ticker.no-sinal{color:var(--muted);}
+  .rc-badge{padding:3px 10px;border-radius:4px;font-size:0.6rem;font-weight:700;font-family:'Syne',sans-serif;letter-spacing:1px;}
+  .rc-badge.sinal{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
+  .rc-badge.no-sinal{background:rgba(107,114,128,0.2);color:var(--muted);border:1px solid var(--border);}
+  .rc-cotacao{font-size:0.7rem;color:var(--muted);margin-bottom:10px;}
+  .rc-cotacao strong{color:var(--text);font-size:0.85rem;}
+  .rc-emas{display:flex;gap:8px;margin-bottom:10px;}
+  .rc-ema{background:var(--bg3);border-radius:4px;padding:3px 8px;font-size:0.58rem;}
+  .rc-ema.e9{color:#ff9900;border:1px solid rgba(255,153,0,0.3);}
+  .rc-ema.e50{color:var(--cyan);border:1px solid rgba(0,229,255,0.3);}
+  .rc-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;}
+  .rc-metric{background:var(--bg3);border-radius:5px;padding:6px 8px;text-align:center;}
+  .rc-metric-label{font-size:0.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}
+  .rc-metric-value{font-size:0.82rem;font-weight:700;margin-top:2px;}
+  .rc-aprovada{margin-top:8px;padding:5px;border-radius:4px;text-align:center;
+    font-family:'Syne',sans-serif;font-size:0.6rem;font-weight:700;letter-spacing:1px;}
+  .rc-aprovada.ok{background:rgba(0,255,136,0.1);color:var(--green);border:1px solid rgba(0,255,136,0.2);}
+  .rc-aprovada.nok{background:rgba(255,68,85,0.1);color:var(--red);border:1px solid rgba(255,68,85,0.2);}
+  .rc-erro{font-size:0.65rem;color:var(--muted);padding:8px 0;}
+  /* NENHUM SINAL */
+  .no-signal-box{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+    padding:32px;text-align:center;grid-column:1/-1;}
+  .no-signal-icon{font-size:2.5rem;margin-bottom:12px;}
+  .no-signal-title{font-family:'Syne',sans-serif;font-size:1rem;font-weight:800;color:var(--muted);margin-bottom:6px;}
+  .no-signal-sub{font-size:0.65rem;color:var(--muted);}
+  @media(max-width:700px){.config-grid{grid-template-columns:1fr 1fr;}.result-cards{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="brand">
+    <div><div class="brand-name">⚛ QUANTTECH</div><div class="brand-sub">TRADING SOLUTIONS</div></div>
+  </div>
+  <div class="nav">
+    <a href="/">ANÁLISE</a>
+    <a href="/estrategias" class="active">ESTRATÉGIAS</a>
+  </div>
+</div>
+
+<div class="container">
+  <div class="page-title">⚡ ESTRATÉGIAS</div>
+  <div class="page-sub">SELECIONE UMA ESTRATÉGIA · CONFIGURE · ESCANEIE O MERCADO</div>
+
+  <!-- STRATEGY CARDS -->
+  <div class="strat-cards">
+    <div class="strat-card selected" onclick="selecionarEstrategia('ema91')" id="card-ema91">
+      <div class="strat-name">EMA 9.1</div>
+      <div class="strat-desc">Sinal de compra quando a EMA 9 vira para cima, está acima da EMA 50 e a EMA 50 está inclinada para cima. Stop e Take Profit ajustáveis.</div>
+      <div class="strat-tags">
+        <span class="strat-tag">TENDÊNCIA</span>
+        <span class="strat-tag">EMA 9</span>
+        <span class="strat-tag">EMA 50</span>
+        <span class="strat-tag">SWING</span>
+      </div>
+    </div>
+    <div class="strat-card" onclick="selecionarEstrategia('em-breve')" style="opacity:0.5;cursor:not-allowed;">
+      <div class="strat-name" style="color:var(--muted)">+ ESTRATÉGIA</div>
+      <div class="strat-desc">Em breve. Novas estratégias serão adicionadas aqui.</div>
+      <div class="strat-tags"><span class="strat-tag" style="color:var(--muted)">EM BREVE</span></div>
+    </div>
+  </div>
+
+  <!-- CONFIG PANEL -->
+  <div class="config-panel visible" id="config-panel">
+    <div class="config-title">⚙ Configuração — EMA 9.1</div>
+    <div class="config-grid">
+      <div class="config-field">
+        <div class="config-label">Take Profit (%)</div>
+        <input type="number" class="config-input" id="cfg-tp" value="5.0" min="0.5" max="50" step="0.5">
+      </div>
+      <div class="config-field">
+        <div class="config-label">Stop Loss (%)</div>
+        <input type="number" class="config-input" id="cfg-sl" value="2.0" min="0.5" max="20" step="0.5">
+      </div>
+      <div class="config-field">
+        <div class="config-label">Timeframe</div>
+        <select class="config-input" id="cfg-tf">
+          <option value="1d" selected>Diário (1D)</option>
+          <option value="1wk">Semanal (1W)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="tickers-section">
+      <div class="tickers-label">Ações para escanear (máx. 15)</div>
+      <div class="tickers-wrap" id="tickers-wrap"></div>
+      <div class="ticker-add">
+        <input type="text" id="ticker-novo" placeholder="Ex: VALE3" maxlength="8"
+               onkeydown="if(event.key==='Enter') adicionarTicker()">
+        <button onclick="adicionarTicker()">+ ADICIONAR</button>
+      </div>
+    </div>
+
+    <button class="btn-scanner" id="btn-scanner" onclick="rodarScanner()">
+      ⚡ ESCANEAR MERCADO
+    </button>
+
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <div class="progress-txt" id="progress-txt">Iniciando scanner...</div>
+    </div>
+  </div>
+
+  <!-- RESULTS -->
+  <div class="results-section" id="results-section">
+    <div class="results-header">
+      <div class="results-title">📊 RESULTADO DO SCANNER</div>
+      <div class="results-summary" id="results-summary"></div>
+    </div>
+    <div class="result-cards" id="result-cards"></div>
+  </div>
+</div>
+
+<script>
+const TICKERS_DEFAULT = ['RANI3','VALE3','PETR4','ITUB4','BBAS3','WEGE3','RENT3','PRIO3','SAPR4','EGIE3'];
+let tickers = [...TICKERS_DEFAULT];
+
+function renderTickers() {
+  const wrap = document.getElementById('tickers-wrap');
+  wrap.innerHTML = tickers.map(t =>
+    `<div class="ticker-chip">${t} <span onclick="removerTicker('${t}')">✕</span></div>`
+  ).join('');
+}
+
+function adicionarTicker() {
+  const inp = document.getElementById('ticker-novo');
+  const t = inp.value.trim().toUpperCase();
+  if (!t) return;
+  if (tickers.includes(t)) { inp.value=''; return; }
+  if (tickers.length >= 15) { alert('Máximo de 15 ações!'); return; }
+  tickers.push(t);
+  renderTickers();
+  inp.value = '';
+}
+
+function removerTicker(t) {
+  tickers = tickers.filter(x => x !== t);
+  renderTickers();
+}
+
+function selecionarEstrategia(id) {
+  if (id === 'em-breve') return;
+  document.querySelectorAll('.strat-card').forEach(c => c.classList.remove('selected'));
+  document.getElementById('card-' + id).classList.add('selected');
+  document.getElementById('config-panel').classList.add('visible');
+}
+
+function rodarScanner() {
+  if (tickers.length === 0) { alert('Adicione pelo menos uma ação!'); return; }
+
+  const btn = document.getElementById('btn-scanner');
+  const prog = document.getElementById('progress-wrap');
+  const fill = document.getElementById('progress-fill');
+  const txt  = document.getElementById('progress-txt');
+  const res  = document.getElementById('results-section');
+
+  btn.disabled = true;
+  btn.textContent = '⏳ ESCANEANDO...';
+  prog.classList.add('visible');
+  res.classList.remove('visible');
+
+  // Animação de progresso
+  let pct = 0;
+  const interval = setInterval(() => {
+    pct = Math.min(pct + (100 / (tickers.length * 4)), 90);
+    fill.style.width = pct + '%';
+    txt.textContent = `Analisando ${tickers.length} ações... ${Math.round(pct)}%`;
+  }, 400);
+
+  fetch('/scanner', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      tickers: tickers,
+      tp: parseFloat(document.getElementById('cfg-tp').value),
+      sl: parseFloat(document.getElementById('cfg-sl').value),
+      timeframe: document.getElementById('cfg-tf').value
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    clearInterval(interval);
+    fill.style.width = '100%';
+    txt.textContent = 'Concluído!';
+    setTimeout(() => { prog.classList.remove('visible'); }, 800);
+
+    if (data.erro) { alert('Erro: ' + data.erro); return; }
+    renderResultados(data.resultados);
+
+    btn.disabled = false;
+    btn.textContent = '⚡ ESCANEAR MERCADO';
+  })
+  .catch(err => {
+    clearInterval(interval);
+    prog.classList.remove('visible');
+    alert('Erro na conexão: ' + err);
+    btn.disabled = false;
+    btn.textContent = '⚡ ESCANEAR MERCADO';
+  });
+}
+
+function renderResultados(resultados) {
+  const section = document.getElementById('results-section');
+  const cards   = document.getElementById('result-cards');
+  const summary = document.getElementById('results-summary');
+
+  const comSinal  = resultados.filter(r => r.sinal && !r.erro);
+  const semSinal  = resultados.filter(r => !r.sinal && !r.erro);
+  const erros     = resultados.filter(r => r.erro);
+
+  summary.innerHTML =
+    `<div class="sum-badge sinal">✅ ${comSinal.length} COM SINAL</div>` +
+    `<div class="sum-badge sem-sinal">⏳ ${semSinal.length} SEM SINAL</div>` +
+    (erros.length ? `<div class="sum-badge sem-sinal">❌ ${erros.length} ERRO</div>` : '');
+
+  // Ordenar: com sinal primeiro
+  const ordenados = [...comSinal, ...semSinal, ...erros];
+
+  if (comSinal.length === 0 && semSinal.length > 0) {
+    cards.innerHTML = `<div class="no-signal-box">
+      <div class="no-signal-icon">⏳</div>
+      <div class="no-signal-title">NENHUMA AÇÃO COM SINAL</div>
+      <div class="no-signal-sub">A estratégia EMA 9.1 não encontrou sinal ativo nas ações escaneadas no momento.<br>
+      Tente novamente mais tarde ou ajuste os parâmetros.</div>
+    </div>`;
+  } else {
+    cards.innerHTML = ordenados.map(r => {
+      if (r.erro) return `<div class="result-card sem-sinal">
+        <div class="rc-header"><span class="rc-ticker no-sinal">${r.ticker}</span>
+          <span class="rc-badge no-sinal">ERRO</span></div>
+        <div class="rc-erro">${r.erro}</div></div>`;
+
+      const cs = r.sinal ? 'com-sinal' : 'sem-sinal';
+      const ct = r.sinal ? 'sinal' : 'no-sinal';
+      const bt = r.sinal ? 'sinal' : 'no-sinal';
+      const bl = r.sinal ? '✅ SINAL ATIVO' : '⏳ SEM SINAL';
+      const lp_c = r.lp_total >= 0 ? '#00ff88' : '#ff4455';
+      const pf_c = r.profit_factor >= 1.5 ? '#00ff88' : (r.profit_factor >= 1 ? '#ffd700' : '#ff4455');
+      const wr_c = r.win_rate >= 50 ? '#00ff88' : (r.win_rate >= 30 ? '#ffd700' : '#ff4455');
+      const dd_c = r.max_dd < 20 ? '#00ff88' : (r.max_dd < 30 ? '#ffd700' : '#ff4455');
+
+      return `<div class="result-card ${cs}">
+        <div class="rc-header">
+          <span class="rc-ticker ${ct}">${r.ticker}</span>
+          <span class="rc-badge ${bt}">${bl}</span>
+        </div>
+        <div class="rc-cotacao">Cotação: <strong>R$ ${r.cotacao.toFixed(2)}</strong></div>
+        <div class="rc-emas">
+          <div class="rc-ema e9">EMA9: ${r.ema9.toFixed(2)}</div>
+          <div class="rc-ema e50">EMA50: ${r.ema50.toFixed(2)}</div>
+        </div>
+        <div class="rc-metrics">
+          <div class="rc-metric">
+            <div class="rc-metric-label">L&P Total</div>
+            <div class="rc-metric-value" style="color:${lp_c}">${r.lp_total > 0 ? '+' : ''}${r.lp_total.toFixed(1)}%</div>
+          </div>
+          <div class="rc-metric">
+            <div class="rc-metric-label">Drawdown Máx.</div>
+            <div class="rc-metric-value" style="color:${dd_c}">${r.max_dd.toFixed(1)}%</div>
+          </div>
+          <div class="rc-metric">
+            <div class="rc-metric-label">Negociações</div>
+            <div class="rc-metric-value" style="color:var(--text)">${r.total_trades}</div>
+          </div>
+          <div class="rc-metric">
+            <div class="rc-metric-label">Lucrativas</div>
+            <div class="rc-metric-value" style="color:${wr_c}">${r.wins}/${r.total_trades} (${r.win_rate.toFixed(0)}%)</div>
+          </div>
+          <div class="rc-metric">
+            <div class="rc-metric-label">Fator de Lucro</div>
+            <div class="rc-metric-value" style="color:${pf_c}">${r.profit_factor.toFixed(2)}</div>
+          </div>
+          <div class="rc-metric">
+            <div class="rc-metric-label">Win Rate</div>
+            <div class="rc-metric-value" style="color:${wr_c}">${r.win_rate.toFixed(1)}%</div>
+          </div>
+        </div>
+        <div class="rc-aprovada ${r.aprovada ? 'ok' : 'nok'}">
+          ${r.aprovada ? '🎉 ESTRATÉGIA APROVADA NESTA AÇÃO' : '❌ ESTRATÉGIA REPROVADA NESTA AÇÃO'}
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  section.classList.add('visible');
+  section.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+// Init
+renderTickers();
+</script>
+</body></html>'''
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'usuarios_ativos': _usuarios_ativos})
