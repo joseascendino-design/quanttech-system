@@ -69,52 +69,165 @@ def limpar_valor(valor_texto):
     except:
         return None
 
+
 BRAPI_TOKEN = 'sDvXn4oPrWRmmZzgTo4wgC'
 
 def buscar_dados_fundamentus(ticker):
+    """Tenta Fundamentus primeiro, usa Brapi como fallback"""
+    dados = _buscar_fundamentus_scraping(ticker)
+    if dados and dados.get('cotacao'):
+        print(f"[OK] Dados via Fundamentus para {ticker}")
+        return dados
+    print(f"[AVISO] Fundamentus falhou, tentando Brapi...")
+    return _buscar_brapi(ticker)
+
+def _buscar_fundamentus_scraping(ticker):
+    import unicodedata
+    ticker_limpo = ticker.replace('.SA', '')
+    url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker_limpo}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Referer': 'https://www.fundamentus.com.br/',
+    }
+    try:
+        session = requests.Session()
+        session.headers.update(headers)
+        try: session.get('https://www.fundamentus.com.br/', timeout=8)
+        except: pass
+        response = session.get(url, timeout=15)
+        response.encoding = 'utf-8'
+        if response.status_code != 200: return None
+        soup = BeautifulSoup(response.text, 'html.parser')
+        tables = soup.find_all('table')
+        if not tables or len(tables) < 2: return None
+
+        dados = {
+            'ticker': ticker_limpo, 'nome': None, 'setor': None, 'subsetor': None,
+            'cotacao': None, 'pl': None, 'pvp': None, 'psr': None, 'p_ebit': None,
+            'ev_ebitda': None, 'ev_ebit': None, 'lpa': None, 'vpa': None,
+            'roe': None, 'roic': None, 'ebit_ativo': None,
+            'margem_bruta': None, 'margem_ebit': None, 'margem_liquida': None,
+            'divida_bruta_patrim': None, 'divida_liquida_pl': None,
+            'divida_liquida_ebitda': None, 'liquidez_corrente': None,
+            'giro_ativos': None, 'crescimento_receita': None, 'div_yield': None,
+            'valor_mercado': None, 'valor_firma': None, 'lucro_liquido': None,
+            'oscilacoes': {}
+        }
+
+        def norm(s):
+            return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
+
+        pares = {}
+        all_cells = []
+        for table in tables:
+            for row in table.find_all('tr'):
+                cells = row.find_all(['td', 'th'])
+                textos = [c.get_text(strip=True) for c in cells]
+                all_cells.extend(textos)
+                for i in range(len(textos)-1):
+                    if textos[i]: pares[textos[i]] = textos[i+1]
+
+        def buscar(labels):
+            for label in labels:
+                nl = norm(label)
+                for k, v in pares.items():
+                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
+                        return limpar_valor(v)
+                for k, v in pares.items():
+                    if nl in norm(k) and v and v.strip() not in ['-','','N/A','--']:
+                        return limpar_valor(v)
+            return None
+
+        try:
+            for table in tables:
+                cells = table.find_all('td')
+                for i, c in enumerate(cells):
+                    if ticker_limpo.upper() in c.get_text(strip=True).upper() and i+1 < len(cells):
+                        n = cells[i+1].get_text(strip=True)
+                        if len(n) > 3: dados['nome'] = n; break
+                if dados['nome']: break
+        except: pass
+
+        for i, c in enumerate(all_cells):
+            if c in ['Setor','Setor:'] and i+1 < len(all_cells): dados['setor'] = all_cells[i+1]
+            if c in ['Subsetor','Subsetor:'] and i+1 < len(all_cells): dados['subsetor'] = all_cells[i+1]
+
+        mapa = {
+            'cotacao': ['Cotacao','Cot.','Cotação'], 'pl': ['P/L'], 'pvp': ['P/VP'],
+            'psr': ['PSR'], 'p_ebit': ['P/EBIT'], 'ev_ebitda': ['EV/EBITDA'], 'ev_ebit': ['EV/EBIT'],
+            'lpa': ['LPA'], 'vpa': ['VPA'], 'roe': ['ROE'], 'roic': ['ROIC'],
+            'ebit_ativo': ['EBIT / Ativo','EBIT/Ativo'],
+            'margem_bruta': ['Marg. Bruta','Marg Bruta'],
+            'margem_ebit': ['Marg. EBIT','Marg EBIT'],
+            'margem_liquida': ['Marg. Liquida','Marg. Líquida'],
+            'divida_bruta_patrim': ['Div. Bruta/ Patrim.','Div. Bruta/Patrim.'],
+            'divida_liquida_ebitda': ['Div. Liq./EBITDA','Div. Líq./EBITDA'],
+            'divida_liquida_pl': ['Div. Liq./Patrim.','Div. Líq./Patrim.'],
+            'liquidez_corrente': ['Liquidez Corr.','Liquidez Corrente'],
+            'giro_ativos': ['Giro Ativos'],
+            'crescimento_receita': ['Cresc. Rec.5a','Cresc. Rec. 5a'],
+            'div_yield': ['Div. Yield'],
+        }
+        for campo, labels in mapa.items():
+            val = buscar(labels)
+            if val is not None: dados[campo] = val
+
+        for i, c in enumerate(all_cells):
+            cl = c.lower()
+            if 'valor de mercado' in cl and i+1 < len(all_cells):
+                try: dados['valor_mercado'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
+                except: pass
+            if 'valor da firma' in cl and i+1 < len(all_cells):
+                try: dados['valor_firma'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
+                except: pass
+            if 'lucro l' in cl and 'quido' in cl and i+1 < len(all_cells):
+                try: dados['lucro_liquido'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
+                except: pass
+
+        osc_labels = {
+            'dia': ['Dia'], 'mes': ['Mes','Mês'], '30_dias': ['30 dias'],
+            '12_meses': ['12 meses'], '2026': ['2026'], '2025': ['2025'],
+            '2024': ['2024'], '2023': ['2023'], '2022': ['2022'],
+        }
+        for chave, labels in osc_labels.items():
+            val = buscar(labels)
+            if val is not None: dados['oscilacoes'][chave] = val
+
+        return dados if dados['cotacao'] else None
+    except Exception as e:
+        print(f"[ERRO] Fundamentus: {e}")
+        return None
+
+def _buscar_brapi(ticker):
     ticker_limpo = ticker.replace('.SA', '').upper()
     try:
         url = f"https://brapi.dev/api/quote/{ticker_limpo}?modules=summaryProfile,defaultKeyStatistics,financialData&token={BRAPI_TOKEN}"
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         j = r.json()
-
-        if not j.get('results'):
-            return None
-
+        if not j.get('results'): return None
         res = j['results'][0]
-
-        def g(d, *keys):
-            for k in keys:
-                if isinstance(d, dict): d = d.get(k)
-                else: return None
-            return d
 
         def pct(v):
             if v is None: return None
             return round(v * 100, 2) if abs(v) < 5 else round(v, 2)
 
-        # Dados diretos do resultado
         cotacao       = res.get('regularMarketPrice')
         nome          = res.get('longName') or res.get('shortName') or ticker_limpo
         valor_mercado = res.get('marketCap')
-
-        # summaryProfile
         sp = res.get('summaryProfile') or {}
         setor    = sp.get('sector')
         subsetor = sp.get('industry')
-
-        # defaultKeyStatistics
         ks = res.get('defaultKeyStatistics') or {}
-        pl             = res.get('priceEarnings') or ks.get('trailingPE')
-        pvp            = ks.get('priceToBook')
-        lpa            = ks.get('trailingEps') or ks.get('forwardEps')
-        vpa            = ks.get('bookValue')
-        ev             = ks.get('enterpriseValue')
-        ev_ebitda      = ks.get('enterpriseToEbitda')
-        ev_ebit        = ks.get('enterpriseToRevenue')
-
-        # financialData
+        pl    = res.get('priceEarnings') or ks.get('trailingPE')
+        pvp   = ks.get('priceToBook')
+        lpa   = ks.get('trailingEps') or ks.get('forwardEps')
+        vpa   = ks.get('bookValue')
+        ev    = ks.get('enterpriseValue')
+        ev_ebitda = ks.get('enterpriseToEbitda')
+        ev_ebit   = ks.get('enterpriseToRevenue')
         fd = res.get('financialData') or {}
         roe            = pct(fd.get('returnOnEquity'))
         roic           = pct(fd.get('returnOnAssets'))
@@ -129,52 +242,23 @@ def buscar_dados_fundamentus(ticker):
         divida_liquida = (divida_total - caixa) if divida_total and caixa else None
         liq_corrente   = fd.get('currentRatio')
         divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
-
-        # Div. Yield — vem direto no resultado principal
         dy_raw = res.get('dividendYield')
         dy = round(dy_raw, 2) if dy_raw and dy_raw > 1 else pct(dy_raw) if dy_raw else None
-
-        # PSR — preço / receita por ação
-        psr = None
-        if cotacao and receita and valor_mercado and valor_mercado > 0:
-            psr = round((valor_mercado / receita), 2)
-
-        # Dívida bruta / patrimônio — debtToEquity já em decimal na Brapi
+        psr = round((valor_mercado / receita), 2) if valor_mercado and receita else None
         divida_bruta_patrim = fd.get('debtToEquity')
-        if divida_bruta_patrim and divida_bruta_patrim > 10:
-            divida_bruta_patrim = divida_bruta_patrim / 100  # alguns casos vem em %
-
-        # Giro ativos
-        giro_ativos = None
+        if divida_bruta_patrim and divida_bruta_patrim > 10: divida_bruta_patrim /= 100
         total_assets = fd.get('totalAssets') or ks.get('totalAssets')
-        if receita and total_assets and total_assets > 0:
-            giro_ativos = round(receita / total_assets, 2)
-
-        # EBIT/Ativo
-        ebit_ativo = None
-        if ebitda and total_assets and total_assets > 0:
-            ebit_ativo = pct(ebitda / total_assets)
-
-        # P/EBIT
+        giro_ativos = round(receita / total_assets, 2) if receita and total_assets and total_assets > 0 else None
+        ebit_ativo = pct(ebitda / total_assets) if ebitda and total_assets and total_assets > 0 else None
         p_ebit = None
         if cotacao and ebitda and valor_mercado and ebitda > 0:
             acoes = valor_mercado / cotacao
             if acoes > 0:
-                ebit_por_acao = ebitda / acoes
-                if ebit_por_acao > 0:
-                    p_ebit = round(cotacao / ebit_por_acao, 1)
-
-        # Crescimento receita — revenueGrowth é YoY, não 5 anos
-        # Usar earningsGrowth como proxy mais estável
-        crescimento_receita = None
+                epj = ebitda / acoes
+                if epj > 0: p_ebit = round(cotacao / epj, 1)
         rg = fd.get('revenueGrowth')
-        if rg is not None and abs(rg) < 5:  # evitar valores absurdos
-            crescimento_receita = pct(rg)
-
-        # Valor firma
+        crescimento_receita = pct(rg) if rg is not None and abs(rg) < 5 else None
         valor_firma = ev
-
-        # Oscilações
         oscilacoes = {}
         try:
             url_osc = f"https://brapi.dev/api/quote/{ticker_limpo}?range=1y&interval=1d&token={BRAPI_TOKEN}"
@@ -190,7 +274,7 @@ def buscar_dados_fundamentus(ticker):
                 if p_12m   and p_hoje: oscilacoes['12_meses'] = round(((p_hoje/p_12m)-1)*100, 1)
         except: pass
 
-        dados = {
+        return {
             'ticker': ticker_limpo, 'nome': nome, 'setor': setor, 'subsetor': subsetor,
             'cotacao': cotacao, 'pl': pl, 'pvp': pvp, 'psr': psr, 'p_ebit': p_ebit,
             'ev_ebitda': ev_ebitda, 'ev_ebit': ev_ebit, 'lpa': lpa, 'vpa': vpa,
@@ -201,266 +285,9 @@ def buscar_dados_fundamentus(ticker):
             'giro_ativos': giro_ativos, 'crescimento_receita': crescimento_receita, 'div_yield': dy,
             'valor_mercado': valor_mercado, 'valor_firma': valor_firma, 'lucro_liquido': lucro_liquido,
             'oscilacoes': oscilacoes
-        }
-        return dados if cotacao else None
-
+        } if cotacao else None
     except Exception as e:
-        print(f"[ERRO] buscar_dados_fundamentus: {e}")
-        traceback.print_exc()
-        return None
-
-        if not j.get('results'):
-            return None
-
-        res = j['results'][0]
-
-        def g(d, *keys):
-            """Pega valor aninhado com segurança"""
-            for k in keys:
-                if isinstance(d, dict):
-                    d = d.get(k)
-                else:
-                    return None
-            return d
-
-        def pct(v):
-            """Converte decimal para percentual se necessário"""
-            if v is None: return None
-            return v * 100 if abs(v) < 5 else v
-
-        cotacao        = g(res, 'regularMarketPrice')
-        pl             = g(res, 'priceToEarningsRatio') or g(res, 'trailingPE')
-        pvp            = g(res, 'priceToBookRatio') or g(res, 'priceToBook')
-        lpa            = g(res, 'eps') or g(res, 'epsTrailingTwelveMonths')
-        dy             = pct(g(res, 'dividendYield'))
-        valor_mercado  = g(res, 'marketCap')
-        nome           = g(res, 'longName') or g(res, 'shortName') or ticker_limpo
-        setor          = g(res, 'sector')
-        subsetor       = g(res, 'industry')
-
-        # Indicadores financeiros
-        fd = res.get('financialData') or {}
-        roe            = pct(g(fd, 'returnOnEquity'))
-        roic           = pct(g(fd, 'returnOnAssets'))  # aproximação
-        margem_bruta   = pct(g(fd, 'grossMargins'))
-        margem_ebit    = pct(g(fd, 'operatingMargins') or g(fd, 'ebitdaMargins'))
-        margem_liquida = pct(g(fd, 'profitMargins'))
-        receita        = g(fd, 'totalRevenue')
-        ebitda         = g(fd, 'ebitda')
-        lucro_liquido  = g(fd, 'netIncomeToCommon') or g(fd, 'freeCashflow')
-        divida_total   = g(fd, 'totalDebt')
-        caixa          = g(fd, 'totalCash')
-        divida_liquida = (divida_total - caixa) if divida_total and caixa else None
-
-        ks = res.get('defaultKeyStatistics') or {}
-        vpa            = g(ks, 'bookValue')
-        ev             = g(ks, 'enterpriseValue')
-        psr            = g(ks, 'priceToSalesTrailing12Months')
-        ev_ebitda      = (ev / ebitda) if ev and ebitda and ebitda > 0 else None
-        divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
-        divida_bruta_patrim = None
-        if divida_total and vpa and valor_mercado:
-            patrim = vpa * (valor_mercado / cotacao) if cotacao else None
-            if patrim and patrim > 0:
-                divida_bruta_patrim = divida_total / patrim
-
-        # Crescimento receita (via histórico se disponível)
-        crescimento_receita = None
-        try:
-            inc = res.get('incomeStatementHistory', {}).get('incomeStatementHistory', [])
-            if len(inc) >= 2:
-                r_new = inc[0].get('totalRevenue', {}).get('raw', 0)
-                r_old = inc[-1].get('totalRevenue', {}).get('raw', 0)
-                if r_old and r_old > 0 and r_new:
-                    anos = len(inc) - 1
-                    crescimento_receita = ((r_new / r_old) ** (1/anos) - 1) * 100
-        except: pass
-
-        # Oscilações via Brapi
-        oscilacoes = {}
-        try:
-            url_osc = f"https://brapi.dev/api/quote/{ticker_limpo}?range=1y&interval=1d&token={BRAPI_TOKEN}"
-            ro = requests.get(url_osc, timeout=15)
-            hist_data = ro.json().get('results', [{}])[0].get('historicalDataPrice', [])
-            if hist_data and len(hist_data) > 1:
-                p_hoje = hist_data[-1].get('close', 0)
-                p_ontem = hist_data[-2].get('close', 0) if len(hist_data) > 1 else 0
-                p_30d   = hist_data[-22].get('close', 0) if len(hist_data) > 22 else 0
-                p_12m   = hist_data[0].get('close', 0)
-                if p_ontem and p_hoje: oscilacoes['dia']     = ((p_hoje/p_ontem)-1)*100
-                if p_30d   and p_hoje: oscilacoes['30_dias'] = ((p_hoje/p_30d)-1)*100
-                if p_12m   and p_hoje: oscilacoes['12_meses']= ((p_hoje/p_12m)-1)*100
-        except: pass
-
-        # Valor firma
-        valor_firma = ev
-
-        dados = {
-            'ticker': ticker_limpo, 'nome': nome, 'setor': setor, 'subsetor': subsetor,
-            'cotacao': cotacao, 'pl': pl, 'pvp': pvp, 'psr': psr, 'p_ebit': None,
-            'ev_ebitda': ev_ebitda, 'ev_ebit': None, 'lpa': lpa, 'vpa': vpa,
-            'roe': roe, 'roic': roic, 'ebit_ativo': None,
-            'margem_bruta': margem_bruta, 'margem_ebit': margem_ebit, 'margem_liquida': margem_liquida,
-            'divida_bruta_patrim': divida_bruta_patrim, 'divida_liquida_pl': None,
-            'divida_liquida_ebitda': divida_liq_ebitda, 'liquidez_corrente': None,
-            'giro_ativos': None, 'crescimento_receita': crescimento_receita, 'div_yield': dy,
-            'valor_mercado': valor_mercado, 'valor_firma': valor_firma, 'lucro_liquido': lucro_liquido,
-            'oscilacoes': oscilacoes
-        }
-        return dados if cotacao else None
-
-    except Exception as e:
-        print(f"[ERRO] buscar_dados_fundamentus: {e}")
-        traceback.print_exc()
-        return None
-        soup = BeautifulSoup(response.text, 'html.parser')
-        tables = soup.find_all('table')
-        if not tables:
-            return None
-
-        dados = {
-            'ticker': ticker_limpo, 'nome': None, 'setor': None, 'subsetor': None,
-            'cotacao': None, 'pl': None, 'pvp': None, 'psr': None, 'p_ebit': None,
-            'ev_ebitda': None, 'ev_ebit': None, 'lpa': None, 'vpa': None,
-            'roe': None, 'roic': None, 'ebit_ativo': None,
-            'margem_bruta': None, 'margem_ebit': None, 'margem_liquida': None,
-            'divida_bruta_patrim': None, 'divida_liquida_pl': None,
-            'divida_liquida_ebitda': None, 'liquidez_corrente': None,
-            'giro_ativos': None, 'crescimento_receita': None, 'div_yield': None,
-            'valor_mercado': None, 'valor_firma': None, 'lucro_liquido': None,
-            'oscilacoes': {}
-        }
-
-        # Extrair todos os pares label→valor das tabelas
-        pares = {}
-        all_cells = []
-        for table in tables:
-            for row in table.find_all('tr'):
-                cells = row.find_all(['td', 'th'])
-                textos = [c.get_text(strip=True) for c in cells]
-                all_cells.extend(textos)
-                # Pares consecutivos label→valor
-                for i in range(0, len(textos) - 1, 2):
-                    if textos[i]:
-                        pares[textos[i]] = textos[i+1] if i+1 < len(textos) else ''
-                # Também mapear posição impar
-                for i in range(len(textos)-1):
-                    if textos[i]:
-                        pares[textos[i]] = textos[i+1]
-
-        def buscar(labels):
-            """Busca valor por múltiplos labels possíveis, insensível a acento/case"""
-            import unicodedata
-            def norm(s):
-                return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
-            for label in labels:
-                nl = norm(label)
-                for k, v in pares.items():
-                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
-                        return limpar_valor(v)
-                # Busca parcial
-                for k, v in pares.items():
-                    if nl in norm(k) and v and v.strip() not in ['-','','N/A','--']:
-                        return limpar_valor(v)
-            return None
-
-        def buscar_raw(labels):
-            """Retorna texto bruto sem limpar"""
-            import unicodedata
-            def norm(s):
-                return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
-            for label in labels:
-                nl = norm(label)
-                for k, v in pares.items():
-                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
-                        return v.strip()
-            return None
-
-        # Nome da empresa
-        try:
-            for table in tables:
-                cells = table.find_all('td')
-                for i, c in enumerate(cells):
-                    if ticker_limpo.upper() in c.get_text(strip=True).upper() and i+1 < len(cells):
-                        nome_candidato = cells[i+1].get_text(strip=True)
-                        if len(nome_candidato) > 3:
-                            dados['nome'] = nome_candidato
-                            break
-                if dados['nome']:
-                    break
-            if not dados['nome'] and len(all_cells) > 2:
-                dados['nome'] = all_cells[1] if len(all_cells[1]) > 3 else all_cells[2]
-        except: pass
-
-        # Setor/Subsetor
-        for i, c in enumerate(all_cells):
-            if c in ['Setor', 'Setor:'] and i+1 < len(all_cells):
-                dados['setor'] = all_cells[i+1]
-            if c in ['Subsetor', 'Subsetor:'] and i+1 < len(all_cells):
-                dados['subsetor'] = all_cells[i+1]
-
-        # Mapeamento robusto com múltiplos labels por campo
-        mapa = {
-            'cotacao':               ['Cotacao', 'Cot.', 'Cotação'],
-            'pl':                    ['P/L', 'P/L '],
-            'pvp':                   ['P/VP', 'P/VP '],
-            'psr':                   ['PSR'],
-            'p_ebit':                ['P/EBIT'],
-            'ev_ebitda':             ['EV/EBITDA'],
-            'ev_ebit':               ['EV/EBIT'],
-            'lpa':                   ['LPA'],
-            'vpa':                   ['VPA'],
-            'roe':                   ['ROE'],
-            'roic':                  ['ROIC'],
-            'ebit_ativo':            ['EBIT / Ativo', 'EBIT/Ativo', 'EBIT / Ativo '],
-            'margem_bruta':          ['Marg. Bruta', 'Margem Bruta', 'Marg Bruta'],
-            'margem_ebit':           ['Marg. EBIT', 'Margem EBIT', 'Marg EBIT'],
-            'margem_liquida':        ['Marg. Liquida', 'Margem Liquida', 'Marg. Líquida', 'Margem Líquida'],
-            'divida_bruta_patrim':   ['Div. Bruta/ Patrim.', 'Div. Bruta/Patrim.', 'Div Bruta/ Patrim', 'Divida Bruta/ Patrim'],
-            'divida_liquida_ebitda': ['Div. Liq./EBITDA', 'Div. Líq./EBITDA', 'Divida Liq./EBITDA'],
-            'divida_liquida_pl':     ['Div. Liq./Patrim.', 'Div. Líq./Patrim.', 'Divida Liq./Patrim'],
-            'liquidez_corrente':     ['Liquidez Corr.', 'Liquidez Corrente', 'Liq. Corrente'],
-            'giro_ativos':           ['Giro Ativos', 'Giro dos Ativos'],
-            'crescimento_receita':   ['Cresc. Rec.5a', 'Cresc. Rec. 5a', 'Cresc Rec 5a', 'Crescimento Rec 5a', 'Cresc. Rec.5anos'],
-            'div_yield':             ['Div. Yield', 'Dividend Yield', 'DY'],
-        }
-
-        for campo, labels in mapa.items():
-            val = buscar(labels)
-            if val is not None:
-                dados[campo] = val
-
-        # Valores absolutos (busca por texto parcial)
-        for i, c in enumerate(all_cells):
-            cl = c.lower()
-            if 'valor de mercado' in cl and i+1 < len(all_cells):
-                try: dados['valor_mercado'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-            if 'valor da firma' in cl and i+1 < len(all_cells):
-                try: dados['valor_firma'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-            if 'lucro l' in cl and 'quido' in cl and i+1 < len(all_cells):
-                try: dados['lucro_liquido'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-
-        # Oscilações
-        osc_labels = {
-            'dia':      ['Dia', '1 Dia'],
-            'mes':      ['Mes', 'Mês', '1 Mes', '1 Mês'],
-            '30_dias':  ['30 dias', '30 Dias'],
-            '12_meses': ['12 meses', '12 Meses'],
-            '2026':     ['2026'], '2025': ['2025'],
-            '2024':     ['2024'], '2023': ['2023'], '2022': ['2022'],
-        }
-        for chave, labels in osc_labels.items():
-            val = buscar(labels)
-            if val is not None:
-                dados['oscilacoes'][chave] = val
-
-        return dados if dados['cotacao'] else None
-
-    except Exception as e:
-        print(f"[ERRO] buscar_dados_fundamentus: {e}")
+        print(f"[ERRO] Brapi: {e}")
         traceback.print_exc()
         return None
 
