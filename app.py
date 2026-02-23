@@ -74,11 +74,127 @@ BRAPI_TOKEN = 'sDvXn4oPrWRmmZzgTo4wgC'
 def buscar_dados_fundamentus(ticker):
     ticker_limpo = ticker.replace('.SA', '').upper()
     try:
-        # Buscar cotação + indicadores fundamentalistas via Brapi
-        url_quote = f"https://brapi.dev/api/quote/{ticker_limpo}?modules=summaryProfile,defaultKeyStatistics,financialData,balanceSheetHistory,incomeStatementHistory&token={BRAPI_TOKEN}"
-        r = requests.get(url_quote, timeout=20)
+        url = f"https://brapi.dev/api/quote/{ticker_limpo}?modules=summaryProfile,defaultKeyStatistics,financialData&token={BRAPI_TOKEN}"
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         j = r.json()
+
+        if not j.get('results'):
+            return None
+
+        res = j['results'][0]
+
+        def g(d, *keys):
+            for k in keys:
+                if isinstance(d, dict): d = d.get(k)
+                else: return None
+            return d
+
+        def pct(v):
+            if v is None: return None
+            return round(v * 100, 2) if abs(v) < 5 else round(v, 2)
+
+        # Dados diretos do resultado
+        cotacao       = res.get('regularMarketPrice')
+        nome          = res.get('longName') or res.get('shortName') or ticker_limpo
+        valor_mercado = res.get('marketCap')
+
+        # summaryProfile
+        sp = res.get('summaryProfile') or {}
+        setor    = sp.get('sector')
+        subsetor = sp.get('industry')
+
+        # defaultKeyStatistics
+        ks = res.get('defaultKeyStatistics') or {}
+        pl             = ks.get('trailingPE') or res.get('priceEarnings')
+        pvp            = ks.get('priceToBook')
+        lpa            = ks.get('trailingEps') or ks.get('forwardEps')
+        vpa            = ks.get('bookValue')
+        ev             = ks.get('enterpriseValue')
+        ev_ebitda      = ks.get('enterpriseToEbitda')
+        ev_ebit        = ks.get('enterpriseToRevenue')
+        psr            = res.get('priceToSalesTrailing12Months') or ks.get('priceToSalesTrailing12Months')
+
+        # financialData
+        fd = res.get('financialData') or {}
+        roe            = pct(fd.get('returnOnEquity'))
+        roic           = pct(fd.get('returnOnAssets'))
+        margem_bruta   = pct(fd.get('grossMargins'))
+        margem_ebit    = pct(fd.get('operatingMargins'))
+        margem_liquida = pct(fd.get('profitMargins'))
+        ebitda         = fd.get('ebitda')
+        lucro_liquido  = fd.get('netIncomeToCommon') or fd.get('freeCashflow')
+        divida_total   = fd.get('totalDebt')
+        caixa          = fd.get('totalCash')
+        receita        = fd.get('totalRevenue')
+        divida_liquida = (divida_total - caixa) if divida_total and caixa else None
+        dy             = pct(res.get('dividendYield') or fd.get('dividendYield'))
+        liq_corrente   = fd.get('currentRatio')
+        divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
+
+        # Dívida bruta / patrimônio
+        divida_bruta_patrim = fd.get('debtToEquity')
+        if divida_bruta_patrim:
+            divida_bruta_patrim = divida_bruta_patrim / 100  # Brapi retorna em %, converter
+
+        # Giro ativos
+        giro_ativos = None
+        total_assets = fd.get('totalAssets') or ks.get('totalAssets')
+        if receita and total_assets and total_assets > 0:
+            giro_ativos = receita / total_assets
+
+        # EBIT/Ativo
+        ebit_ativo = None
+        if ebitda and total_assets and total_assets > 0:
+            ebit_ativo = pct(ebitda / total_assets)
+
+        # P/EBIT
+        p_ebit = None
+        if cotacao and ebitda and valor_mercado and ebitda > 0:
+            ebit_por_acao = ebitda / (valor_mercado / cotacao) if valor_mercado and cotacao else None
+            if ebit_por_acao and ebit_por_acao > 0:
+                p_ebit = cotacao / ebit_por_acao
+
+        # Crescimento receita
+        crescimento_receita = pct(fd.get('revenueGrowth') or fd.get('earningsGrowth'))
+
+        # Valor firma
+        valor_firma = ev
+
+        # Oscilações
+        oscilacoes = {}
+        try:
+            url_osc = f"https://brapi.dev/api/quote/{ticker_limpo}?range=1y&interval=1d&token={BRAPI_TOKEN}"
+            ro = requests.get(url_osc, timeout=15)
+            hist_data = ro.json().get('results', [{}])[0].get('historicalDataPrice', [])
+            if hist_data and len(hist_data) > 1:
+                p_hoje = hist_data[-1].get('close', 0)
+                p_ontem = hist_data[-2].get('close', 0)
+                p_30d   = hist_data[-22].get('close', 0) if len(hist_data) > 22 else 0
+                p_12m   = hist_data[0].get('close', 0)
+                if p_ontem and p_hoje: oscilacoes['dia']      = round(((p_hoje/p_ontem)-1)*100, 1)
+                if p_30d   and p_hoje: oscilacoes['30_dias']  = round(((p_hoje/p_30d)-1)*100, 1)
+                if p_12m   and p_hoje: oscilacoes['12_meses'] = round(((p_hoje/p_12m)-1)*100, 1)
+        except: pass
+
+        dados = {
+            'ticker': ticker_limpo, 'nome': nome, 'setor': setor, 'subsetor': subsetor,
+            'cotacao': cotacao, 'pl': pl, 'pvp': pvp, 'psr': psr, 'p_ebit': p_ebit,
+            'ev_ebitda': ev_ebitda, 'ev_ebit': ev_ebit, 'lpa': lpa, 'vpa': vpa,
+            'roe': roe, 'roic': roic, 'ebit_ativo': ebit_ativo,
+            'margem_bruta': margem_bruta, 'margem_ebit': margem_ebit, 'margem_liquida': margem_liquida,
+            'divida_bruta_patrim': divida_bruta_patrim, 'divida_liquida_pl': None,
+            'divida_liquida_ebitda': divida_liq_ebitda, 'liquidez_corrente': liq_corrente,
+            'giro_ativos': giro_ativos, 'crescimento_receita': crescimento_receita, 'div_yield': dy,
+            'valor_mercado': valor_mercado, 'valor_firma': valor_firma, 'lucro_liquido': lucro_liquido,
+            'oscilacoes': oscilacoes
+        }
+        return dados if cotacao else None
+
+    except Exception as e:
+        print(f"[ERRO] buscar_dados_fundamentus: {e}")
+        traceback.print_exc()
+        return None
 
         if not j.get('results'):
             return None
