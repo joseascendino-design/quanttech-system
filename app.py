@@ -1077,13 +1077,16 @@ def estrategias_route():
 
 @app.route('/scanner', methods=['POST'])
 def scanner_route():
-    """Roda o scanner da estratégia EMA 9.1 nas ações enviadas"""
+    """Roda o scanner da estratégia selecionada nas ações enviadas"""
     try:
         data = request.get_json()
-        tickers   = [t.strip().upper() for t in data.get('tickers', []) if t.strip()]
-        tp_pct    = float(data.get('tp', 5.0))
-        sl_pct    = float(data.get('sl', 2.0))
-        timeframe = data.get('timeframe', '1d')
+        tickers    = [t.strip().upper() for t in data.get('tickers', []) if t.strip()]
+        tp_pct     = float(data.get('tp', 5.0))
+        sl_pct     = float(data.get('sl', 2.0))
+        timeframe  = data.get('timeframe', '1d')
+        estrategia = data.get('estrategia', 'ema91')
+        vol_mult   = float(data.get('vol_mult', 4.0))
+        vol_period = int(data.get('vol_period', 20))
 
         if not tickers:
             return jsonify({'erro': 'Nenhum ticker informado'}), 400
@@ -1104,23 +1107,39 @@ def scanner_route():
                 ema9  = close.ewm(span=9,  adjust=False).mean()
                 ema50 = close.ewm(span=50, adjust=False).mean()
 
-                # Sinal atual — verifica candle atual e 2 anteriores (como TradingView)
-                sinal_ativo = False
-                sinal_candle = 0
-                if len(ema9) >= 5:
+                # ── VOLUME EXPLOSIVO ──────────────────────────────────
+                if estrategia == 'volume':
+                    volume = df['Volume']
+                    vol_ma = volume.rolling(vol_period).mean()
+                    sinal_ativo  = False
+                    sinal_candle = 0
                     for lookback in [0, 1, 2]:
                         idx = -(1 + lookback)
-                        e9_now   = ema9.iloc[idx]
-                        e9_prev  = ema9.iloc[idx - 1]
-                        e9_prev2 = ema9.iloc[idx - 2]
-                        e50_now  = ema50.iloc[idx]
-                        e50_prev = ema50.iloc[idx - 1]
-                        virou  = (e9_now > e9_prev) and (e9_prev < e9_prev2) and (e9_now > e50_now)
-                        inclin = e50_now > e50_prev
-                        if virou and inclin:
-                            sinal_ativo  = True
-                            sinal_candle = lookback
-                            break
+                        if vol_ma.iloc[idx] and vol_ma.iloc[idx] > 0:
+                            if volume.iloc[idx] > (vol_ma.iloc[idx] * vol_mult):
+                                sinal_ativo  = True
+                                sinal_candle = lookback
+                                break
+
+                # ── EMA 9.1 ───────────────────────────────────────────────
+                else:
+                    # Sinal atual — verifica candle atual e 2 anteriores (como TradingView)
+                    sinal_ativo = False
+                    sinal_candle = 0
+                    if len(ema9) >= 5:
+                        for lookback in [0, 1, 2]:
+                            idx = -(1 + lookback)
+                            e9_now   = ema9.iloc[idx]
+                            e9_prev  = ema9.iloc[idx - 1]
+                            e9_prev2 = ema9.iloc[idx - 2]
+                            e50_now  = ema50.iloc[idx]
+                            e50_prev = ema50.iloc[idx - 1]
+                            virou  = (e9_now > e9_prev) and (e9_prev < e9_prev2) and (e9_now > e50_now)
+                            inclin = e50_now > e50_prev
+                            if virou and inclin:
+                                sinal_ativo  = True
+                                sinal_candle = lookback
+                                break
 
                 # Backtesting da estratégia
                 trades = []
@@ -1180,6 +1199,10 @@ def scanner_route():
                     'ticker':         ticker,
                     'sinal':          sinal_ativo,
                     'sinal_candle':   sinal_candle if sinal_ativo else -1,
+                    'estrategia':     estrategia,
+                    'volume_atual':   int(df['Volume'].iloc[-1]) if estrategia == 'volume' else None,
+                    'volume_media':   int(df['Volume'].rolling(vol_period).mean().iloc[-1]) if estrategia == 'volume' else None,
+                    'volume_mult_real': round(df['Volume'].iloc[-1] / df['Volume'].rolling(vol_period).mean().iloc[-1], 1) if estrategia == 'volume' and df['Volume'].rolling(vol_period).mean().iloc[-1] > 0 else None,
                     'cotacao':        round(float(close.iloc[-1]), 2),
                     'ema9':           round(float(ema9.iloc[-1]), 2),
                     'ema50':          round(float(ema50.iloc[-1]), 2),
@@ -1357,7 +1380,16 @@ PAGINA_ESTRATEGIAS = '''<!DOCTYPE html>
         <span class="strat-tag">SWING</span>
       </div>
     </div>
-    <div class="strat-card" onclick="selecionarEstrategia('em-breve')" style="opacity:0.5;cursor:not-allowed;">
+    <div class="strat-card" onclick="selecionarEstrategia('volume')" id="card-volume">
+      <div class="strat-name" style="color:#ffd700">📊 VOLUME EXPLOSIVO</div>
+      <div class="strat-desc">Sinal quando o volume do candle atual é mais de 4x a média de volume dos últimos 20 períodos. Identifica movimentos com força institucional.</div>
+      <div class="strat-tags">
+        <span class="strat-tag" style="color:#ffd700">VOLUME</span>
+        <span class="strat-tag" style="color:#ffd700">INSTITUCIONAL</span>
+        <span class="strat-tag" style="color:#ffd700">BREAKOUT</span>
+      </div>
+    </div>
+    <div class="strat-card" onclick="selecionarEstrategia('em-breve')" style="opacity:0.4;cursor:not-allowed;">
       <div class="strat-name" style="color:var(--muted)">+ ESTRATÉGIA</div>
       <div class="strat-desc">Em breve. Novas estratégias serão adicionadas aqui.</div>
       <div class="strat-tags"><span class="strat-tag" style="color:var(--muted)">EM BREVE</span></div>
@@ -1366,8 +1398,8 @@ PAGINA_ESTRATEGIAS = '''<!DOCTYPE html>
 
   <!-- CONFIG PANEL -->
   <div class="config-panel visible" id="config-panel">
-    <div class="config-title">⚙ Configuração — EMA 9.1</div>
-    <div class="config-grid">
+    <div class="config-title" id="config-title">⚙ Configuração — EMA 9.1</div>
+    <div class="config-grid" id="cfg-ema91-params">
       <div class="config-field">
         <div class="config-label">Take Profit (%)</div>
         <input type="number" class="config-input" id="cfg-tp" value="5.0" min="0.5" max="50" step="0.5">
@@ -1379,6 +1411,23 @@ PAGINA_ESTRATEGIAS = '''<!DOCTYPE html>
       <div class="config-field">
         <div class="config-label">Timeframe</div>
         <select class="config-input" id="cfg-tf">
+          <option value="1d" selected>Diário (1D)</option>
+          <option value="1wk">Semanal (1W)</option>
+        </select>
+      </div>
+    </div>
+    <div class="config-grid" id="cfg-volume-params" style="display:none">
+      <div class="config-field">
+        <div class="config-label">Multiplicador de Volume</div>
+        <input type="number" class="config-input" id="cfg-vol-mult" value="4" min="1" max="20" step="0.5">
+      </div>
+      <div class="config-field">
+        <div class="config-label">Média de Volume (períodos)</div>
+        <input type="number" class="config-input" id="cfg-vol-period" value="20" min="5" max="100" step="1">
+      </div>
+      <div class="config-field">
+        <div class="config-label">Timeframe</div>
+        <select class="config-input" id="cfg-vol-tf">
           <option value="1d" selected>Diário (1D)</option>
           <option value="1wk">Semanal (1W)</option>
         </select>
@@ -1442,11 +1491,18 @@ function removerTicker(t) {
   renderTickers();
 }
 
+let estrategiaAtual = 'ema91';
 function selecionarEstrategia(id) {
   if (id === 'em-breve') return;
+  estrategiaAtual = id;
   document.querySelectorAll('.strat-card').forEach(c => c.classList.remove('selected'));
   document.getElementById('card-' + id).classList.add('selected');
   document.getElementById('config-panel').classList.add('visible');
+  // Mostrar/ocultar params
+  document.getElementById('cfg-ema91-params').style.display  = id === 'ema91'   ? 'grid' : 'none';
+  document.getElementById('cfg-volume-params').style.display = id === 'volume'  ? 'grid' : 'none';
+  const titles = {ema91: '⚙ Configuração — EMA 9.1', volume: '⚙ Configuração — Volume Explosivo'};
+  document.getElementById('config-title').textContent = titles[id] || '⚙ Configuração';
 }
 
 function rodarScanner() {
@@ -1471,15 +1527,21 @@ function rodarScanner() {
     txt.textContent = `Analisando ${tickers.length} ações... ${Math.round(pct)}%`;
   }, 400);
 
+  const payload = {
+    tickers: tickers,
+    estrategia: estrategiaAtual,
+    tp: parseFloat(document.getElementById('cfg-tp').value || 5),
+    sl: parseFloat(document.getElementById('cfg-sl').value || 2),
+    timeframe: estrategiaAtual === 'volume'
+      ? document.getElementById('cfg-vol-tf').value
+      : document.getElementById('cfg-tf').value,
+    vol_mult:   parseFloat(document.getElementById('cfg-vol-mult') ? document.getElementById('cfg-vol-mult').value : 4),
+    vol_period: parseInt(document.getElementById('cfg-vol-period') ? document.getElementById('cfg-vol-period').value : 20),
+  };
   fetch('/scanner', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      tickers: tickers,
-      tp: parseFloat(document.getElementById('cfg-tp').value),
-      sl: parseFloat(document.getElementById('cfg-sl').value),
-      timeframe: document.getElementById('cfg-tf').value
-    })
+    body: JSON.stringify(payload)
   })
   .then(r => r.json())
   .then(data => {
@@ -1550,10 +1612,17 @@ function renderResultados(resultados) {
           <span class="rc-badge ${bt}">${bl}</span>
         </div>
         <div class="rc-cotacao">Cotação: <strong>R$ ${r.cotacao.toFixed(2)}</strong></div>
-        <div class="rc-emas">
-          <div class="rc-ema e9">EMA9: ${r.ema9.toFixed(2)}</div>
-          <div class="rc-ema e50">EMA50: ${r.ema50.toFixed(2)}</div>
-        </div>
+        ${r.estrategia === 'volume'
+          ? `<div class="rc-emas">
+              <div class="rc-ema e9" style="color:#ffd700;border-color:rgba(255,215,0,0.3)">📊 Vol: ${r.volume_atual ? r.volume_atual.toLocaleString('pt-BR') : '—'}</div>
+              <div class="rc-ema e50">Média(${r.volume_media ? r.volume_media.toLocaleString('pt-BR') : '—'})</div>
+              <div class="rc-ema e9" style="color:#ffd700;border-color:rgba(255,215,0,0.3)">${r.volume_mult_real ? r.volume_mult_real + 'x média' : ''}</div>
+            </div>`
+          : `<div class="rc-emas">
+              <div class="rc-ema e9">EMA9: ${r.ema9.toFixed(2)}</div>
+              <div class="rc-ema e50">EMA50: ${r.ema50.toFixed(2)}</div>
+            </div>`
+        }
         <div class="rc-metrics">
           <div class="rc-metric">
             <div class="rc-metric-label">L&P Total</div>
