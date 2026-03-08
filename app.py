@@ -11,7 +11,8 @@ from urllib.parse import urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-PORT = 8765
+import os
+PORT = int(os.environ.get("PORT", 8765))
 
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -2143,8 +2144,7 @@ if __name__ == "__main__":
     print("="*52)
     print("  Pressione Ctrl+C para encerrar\n")
 
-    server = HTTPServer(("localhost", PORT), Handler)
-    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
