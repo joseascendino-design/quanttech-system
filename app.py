@@ -1,6 +1,6 @@
 """
 QUANTTECH VALOR JUSTO
-Execute: python quanttech.py
+Execute: python app.py
 Acesse:  http://localhost:8765
 Sem necessidade de chave de API!
 """
@@ -11,8 +11,36 @@ from urllib.parse import urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
+# ── Compatibilidade com Gunicorn/Railway ──────────────────────────
+# Railway detecta automaticamente e tenta usar Gunicorn (WSGI)
+# Este objeto garante que o servidor HTTPServer seja iniciado corretamente
+class _WSGICompat:
+    """Adapter mínimo para satisfazer Gunicorn e iniciar nosso HTTPServer."""
+    def __init__(self):
+        self._started = False
+    def __call__(self, environ, start_response):
+        if not self._started:
+            self._started = True
+            t = threading.Thread(target=_iniciar_http, daemon=True)
+            t.start()
+        status = '200 OK'
+        headers = [('Content-type', 'text/plain')]
+        start_response(status, headers)
+        return [b'QuantTech iniciando...']
+
+def _iniciar_http():
+    import time, os
+    time.sleep(1)
+    port = int(os.environ.get("PORT", 8765))
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    srv.serve_forever()
+
+app = _WSGICompat()
+# ─────────────────────────────────────────────────────────────────
+
 import os
 PORT = int(os.environ.get("PORT", 8765))
+
 
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -2133,19 +2161,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def iniciar():
     print("\n" + "="*52)
     print("  📊  QUANTTECH VALOR JUSTO")
     print("="*52)
-    print(f"  ✅  Sem necessidade de chave de API")
-    print(f"  ✅  Dados reais automaticamente")
-    print(f"  ✅  Fundamentus + Investidor10 + IPCA")
-    print(f"  🌐  Acesse: http://localhost:{PORT}")
-    print("="*52)
-    print("  Pressione Ctrl+C para encerrar\n")
-
+    print(f"  🌐  Acesse: http://0.0.0.0:{PORT}")
+    print("="*52 + "\n")
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n  Encerrado. Até logo!")
+        print("\n  Encerrado.")
+
+# Roda tanto via `python app.py` quanto via Gunicorn
+iniciar()
