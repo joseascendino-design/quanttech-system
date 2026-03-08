@@ -1,1679 +1,2151 @@
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import yfinance as yf
-from datetime import datetime
-import warnings
-import threading
-import traceback
-from flask import Flask, jsonify, request, Response
-
-warnings.filterwarnings('ignore')
-
-# ── Colorama stub (não usado no servidor, mas evita erros se importado) ──
-class _ForeStub:
-    def __getattr__(self, _): return ''
-class _StyleStub:
-    def __getattr__(self, _): return ''
-Fore  = _ForeStub()
-Style = _StyleStub()
-
-def log_diagnostico(ticker, etapa, detalhes, tipo="INFO"):
-    if tipo in ["ERRO", "AVISO"]:
-        print(f"[{tipo}] {ticker} | {etapa}: {detalhes}")
-
-# ══════════════════════════════════════════════════════════════
-#  LÓGICA DE NEGÓCIO (mesma do quanttech.py local)
-# ══════════════════════════════════════════════════════════════
-
-def calcular_preco_justo_graham(lpa, crescimento_receita, vpa, score_total=0):
-    if not lpa or not crescimento_receita or not vpa:
-        return None, 0
-    try:
-        g = min(abs(crescimento_receita), 50)
-        if lpa <= 0: return None, 0
-        valor_raiz = lpa * (8.5 + 2 * g) * 4.4
-        if valor_raiz <= 0: return None, 0
-        valor_intrinseco = valor_raiz ** 0.5
-        if not isinstance(valor_intrinseco, (int, float)) or valor_intrinseco != valor_intrinseco:
-            return None, 0
-        if score_total >= 70:
-            multiplicador = 1 + (score_total / 100) * 0.5
-            return valor_intrinseco * multiplicador, int((multiplicador - 1) * 100)
-        return valor_intrinseco, 0
-    except:
-        return None, 0
-
-def calcular_preco_teto(lpa, vpa, score_qualidade=0):
-    if not lpa or not vpa: return None, 0
-    try:
-        if lpa <= 0 or vpa <= 0: return None, 0
-        valor_raiz = 22.5 * lpa * vpa
-        if valor_raiz <= 0: return None, 0
-        valor_teto = valor_raiz ** 0.5
-        if not isinstance(valor_teto, (int, float)) or valor_teto != valor_teto:
-            return None, 0
-        if score_qualidade >= 30:
-            multiplicador = 1 + (score_qualidade / 40) * 0.3
-            return valor_teto * multiplicador, int((multiplicador - 1) * 100)
-        return valor_teto, 0
-    except:
-        return None, 0
-
-def limpar_valor(valor_texto):
-    if not valor_texto or valor_texto.strip() in ['-', '', 'N/A', '--']:
-        return None
-    try:
-        valor_limpo = valor_texto.replace('.', '').replace(',', '.').replace('%', '').strip()
-        return float(valor_limpo)
-    except:
-        return None
-
-
-BRAPI_TOKEN = 'sDvXn4oPrWRmmZzgTo4wgC'
-
-def buscar_dados_fundamentus(ticker):
-    """Tenta Fundamentus primeiro, usa Brapi como fallback"""
-    dados = _buscar_fundamentus_scraping(ticker)
-    if dados and dados.get('cotacao'):
-        print(f"[OK] Dados via Fundamentus para {ticker}")
-        return dados
-    print(f"[AVISO] Fundamentus falhou, tentando Brapi...")
-    return _buscar_brapi(ticker)
-
-def _buscar_fundamentus_scraping(ticker):
-    import unicodedata
-    ticker_limpo = ticker.replace('.SA', '')
-    url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker_limpo}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-        'Referer': 'https://www.fundamentus.com.br/',
-    }
-    try:
-        session = requests.Session()
-        session.headers.update(headers)
-        try: session.get('https://www.fundamentus.com.br/', timeout=8)
-        except: pass
-        response = session.get(url, timeout=15)
-        response.encoding = 'utf-8'
-        if response.status_code != 200: return None
-        soup = BeautifulSoup(response.text, 'html.parser')
-        tables = soup.find_all('table')
-        if not tables or len(tables) < 2: return None
-
-        dados = {
-            'ticker': ticker_limpo, 'nome': None, 'setor': None, 'subsetor': None,
-            'cotacao': None, 'pl': None, 'pvp': None, 'psr': None, 'p_ebit': None,
-            'ev_ebitda': None, 'ev_ebit': None, 'lpa': None, 'vpa': None,
-            'roe': None, 'roic': None, 'ebit_ativo': None,
-            'margem_bruta': None, 'margem_ebit': None, 'margem_liquida': None,
-            'divida_bruta_patrim': None, 'divida_liquida_pl': None,
-            'divida_liquida_ebitda': None, 'liquidez_corrente': None,
-            'giro_ativos': None, 'crescimento_receita': None, 'div_yield': None,
-            'valor_mercado': None, 'valor_firma': None, 'lucro_liquido': None,
-            'oscilacoes': {}
-        }
-
-        def norm(s):
-            return unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode().lower().strip()
-
-        pares = {}
-        all_cells = []
-        for table in tables:
-            for row in table.find_all('tr'):
-                cells = row.find_all(['td', 'th'])
-                textos = [c.get_text(strip=True) for c in cells]
-                all_cells.extend(textos)
-                for i in range(len(textos)-1):
-                    if textos[i]: pares[textos[i]] = textos[i+1]
-
-        def buscar(labels):
-            for label in labels:
-                nl = norm(label)
-                for k, v in pares.items():
-                    if norm(k) == nl and v and v.strip() not in ['-','','N/A','--']:
-                        return limpar_valor(v)
-                for k, v in pares.items():
-                    if nl in norm(k) and v and v.strip() not in ['-','','N/A','--']:
-                        return limpar_valor(v)
-            return None
-
-        try:
-            for table in tables:
-                cells = table.find_all('td')
-                for i, c in enumerate(cells):
-                    if ticker_limpo.upper() in c.get_text(strip=True).upper() and i+1 < len(cells):
-                        n = cells[i+1].get_text(strip=True)
-                        if len(n) > 3: dados['nome'] = n; break
-                if dados['nome']: break
-        except: pass
-
-        for i, c in enumerate(all_cells):
-            if c in ['Setor','Setor:'] and i+1 < len(all_cells): dados['setor'] = all_cells[i+1]
-            if c in ['Subsetor','Subsetor:'] and i+1 < len(all_cells): dados['subsetor'] = all_cells[i+1]
-
-        mapa = {
-            'cotacao': ['Cotacao','Cot.','Cotação'], 'pl': ['P/L'], 'pvp': ['P/VP'],
-            'psr': ['PSR'], 'p_ebit': ['P/EBIT'], 'ev_ebitda': ['EV/EBITDA'], 'ev_ebit': ['EV/EBIT'],
-            'lpa': ['LPA'], 'vpa': ['VPA'], 'roe': ['ROE'], 'roic': ['ROIC'],
-            'ebit_ativo': ['EBIT / Ativo','EBIT/Ativo'],
-            'margem_bruta': ['Marg. Bruta','Marg Bruta'],
-            'margem_ebit': ['Marg. EBIT','Marg EBIT'],
-            'margem_liquida': ['Marg. Liquida','Marg. Líquida'],
-            'divida_bruta_patrim': ['Div. Bruta/ Patrim.','Div. Bruta/Patrim.'],
-            'divida_liquida_ebitda': ['Div. Liq./EBITDA','Div. Líq./EBITDA'],
-            'divida_liquida_pl': ['Div. Liq./Patrim.','Div. Líq./Patrim.'],
-            'liquidez_corrente': ['Liquidez Corr.','Liquidez Corrente'],
-            'giro_ativos': ['Giro Ativos'],
-            'crescimento_receita': ['Cresc. Rec.5a','Cresc. Rec. 5a'],
-            'div_yield': ['Div. Yield'],
-        }
-        for campo, labels in mapa.items():
-            val = buscar(labels)
-            if val is not None: dados[campo] = val
-
-        for i, c in enumerate(all_cells):
-            cl = c.lower()
-            if 'valor de mercado' in cl and i+1 < len(all_cells):
-                try: dados['valor_mercado'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-            if 'valor da firma' in cl and i+1 < len(all_cells):
-                try: dados['valor_firma'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-            if 'lucro l' in cl and 'quido' in cl and i+1 < len(all_cells):
-                try: dados['lucro_liquido'] = float(all_cells[i+1].replace('.','').replace(',','.').strip())
-                except: pass
-
-        osc_labels = {
-            'dia': ['Dia'], 'mes': ['Mes','Mês'], '30_dias': ['30 dias'],
-            '12_meses': ['12 meses'], '2026': ['2026'], '2025': ['2025'],
-            '2024': ['2024'], '2023': ['2023'], '2022': ['2022'],
-        }
-        for chave, labels in osc_labels.items():
-            val = buscar(labels)
-            if val is not None: dados['oscilacoes'][chave] = val
-
-        return dados if dados['cotacao'] else None
-    except Exception as e:
-        print(f"[ERRO] Fundamentus: {e}")
-        return None
-
-def _buscar_brapi(ticker):
-    ticker_limpo = ticker.replace('.SA', '').upper()
-    try:
-        url = f"https://brapi.dev/api/quote/{ticker_limpo}?modules=summaryProfile,defaultKeyStatistics,financialData&token={BRAPI_TOKEN}"
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        if not j.get('results'): return None
-        res = j['results'][0]
-
-        def pct(v):
-            if v is None: return None
-            return round(v * 100, 2) if abs(v) < 5 else round(v, 2)
-
-        cotacao       = res.get('regularMarketPrice')
-        nome          = res.get('longName') or res.get('shortName') or ticker_limpo
-        valor_mercado = res.get('marketCap')
-        sp = res.get('summaryProfile') or {}
-        setor    = sp.get('sector')
-        subsetor = sp.get('industry')
-        ks = res.get('defaultKeyStatistics') or {}
-        pl    = res.get('priceEarnings') or ks.get('trailingPE')
-        pvp   = ks.get('priceToBook')
-        lpa   = ks.get('trailingEps') or ks.get('forwardEps')
-        vpa   = ks.get('bookValue')
-        ev    = ks.get('enterpriseValue')
-        ev_ebitda = ks.get('enterpriseToEbitda')
-        ev_ebit   = ks.get('enterpriseToRevenue')
-        fd = res.get('financialData') or {}
-        roe            = pct(fd.get('returnOnEquity'))
-        roic           = pct(fd.get('returnOnAssets'))
-        margem_bruta   = pct(fd.get('grossMargins'))
-        margem_ebit    = pct(fd.get('operatingMargins'))
-        margem_liquida = pct(fd.get('profitMargins'))
-        ebitda         = fd.get('ebitda')
-        lucro_liquido  = fd.get('netIncomeToCommon') or fd.get('freeCashflow')
-        divida_total   = fd.get('totalDebt')
-        caixa          = fd.get('totalCash')
-        receita        = fd.get('totalRevenue')
-        divida_liquida = (divida_total - caixa) if divida_total and caixa else None
-        liq_corrente   = fd.get('currentRatio')
-        divida_liq_ebitda = (divida_liquida / ebitda) if divida_liquida and ebitda and ebitda > 0 else None
-        dy_raw = res.get('dividendYield')
-        dy = round(dy_raw, 2) if dy_raw and dy_raw > 1 else pct(dy_raw) if dy_raw else None
-        psr = round((valor_mercado / receita), 2) if valor_mercado and receita else None
-        divida_bruta_patrim = fd.get('debtToEquity')
-        if divida_bruta_patrim and divida_bruta_patrim > 10: divida_bruta_patrim /= 100
-        total_assets = fd.get('totalAssets') or ks.get('totalAssets')
-        giro_ativos = round(receita / total_assets, 2) if receita and total_assets and total_assets > 0 else None
-        ebit_ativo = pct(ebitda / total_assets) if ebitda and total_assets and total_assets > 0 else None
-        p_ebit = None
-        if cotacao and ebitda and valor_mercado and ebitda > 0:
-            acoes = valor_mercado / cotacao
-            if acoes > 0:
-                epj = ebitda / acoes
-                if epj > 0: p_ebit = round(cotacao / epj, 1)
-        rg = fd.get('revenueGrowth')
-        crescimento_receita = pct(rg) if rg is not None and abs(rg) < 5 else None
-        valor_firma = ev
-        oscilacoes = {}
-        try:
-            url_osc = f"https://brapi.dev/api/quote/{ticker_limpo}?range=1y&interval=1d&token={BRAPI_TOKEN}"
-            ro = requests.get(url_osc, timeout=15)
-            hist_data = ro.json().get('results', [{}])[0].get('historicalDataPrice', [])
-            if hist_data and len(hist_data) > 1:
-                p_hoje = hist_data[-1].get('close', 0)
-                p_ontem = hist_data[-2].get('close', 0)
-                p_30d   = hist_data[-22].get('close', 0) if len(hist_data) > 22 else 0
-                p_12m   = hist_data[0].get('close', 0)
-                if p_ontem and p_hoje: oscilacoes['dia']      = round(((p_hoje/p_ontem)-1)*100, 1)
-                if p_30d   and p_hoje: oscilacoes['30_dias']  = round(((p_hoje/p_30d)-1)*100, 1)
-                if p_12m   and p_hoje: oscilacoes['12_meses'] = round(((p_hoje/p_12m)-1)*100, 1)
-        except: pass
-
-        return {
-            'ticker': ticker_limpo, 'nome': nome, 'setor': setor, 'subsetor': subsetor,
-            'cotacao': cotacao, 'pl': pl, 'pvp': pvp, 'psr': psr, 'p_ebit': p_ebit,
-            'ev_ebitda': ev_ebitda, 'ev_ebit': ev_ebit, 'lpa': lpa, 'vpa': vpa,
-            'roe': roe, 'roic': roic, 'ebit_ativo': ebit_ativo,
-            'margem_bruta': margem_bruta, 'margem_ebit': margem_ebit, 'margem_liquida': margem_liquida,
-            'divida_bruta_patrim': divida_bruta_patrim, 'divida_liquida_pl': None,
-            'divida_liquida_ebitda': divida_liq_ebitda, 'liquidez_corrente': liq_corrente,
-            'giro_ativos': giro_ativos, 'crescimento_receita': crescimento_receita, 'div_yield': dy,
-            'valor_mercado': valor_mercado, 'valor_firma': valor_firma, 'lucro_liquido': lucro_liquido,
-            'oscilacoes': oscilacoes
-        } if cotacao else None
-    except Exception as e:
-        print(f"[ERRO] Brapi: {e}")
-        traceback.print_exc()
-        return None
-
-def calcular_score_consolidado(dados):
-    score = {'qualidade': 0, 'valuation': 0, 'crescimento': 0, 'solidez': 0,
-             'total': 0, 'eh_banco': False, 'empresa_crescimento': False}
-
-    # Detectar banco
-    nome = (dados.get('nome') or '').lower()
-    setor = (dados.get('setor') or '').lower()
-    eh_banco = any(x in nome+setor for x in ['banco','financ','bradesco','itaú','itau','santander','btg','xp invest','caixa'])
-    score['eh_banco'] = eh_banco
-
-    # QUALIDADE (40pts)
-    roe = dados.get('roe')
-    if roe:
-        if roe >= 20: score['qualidade'] += 15
-        elif roe >= 15: score['qualidade'] += 10
-        elif roe >= 10: score['qualidade'] += 5
-
-    roic = dados.get('roic')
-    if roic:
-        if roic >= 15: score['qualidade'] += 10
-        elif roic >= 10: score['qualidade'] += 7
-        elif roic >= 6: score['qualidade'] += 3
-
-    ml = dados.get('margem_liquida')
-    if ml:
-        if ml >= 15: score['qualidade'] += 10
-        elif ml >= 8: score['qualidade'] += 6
-        elif ml >= 3: score['qualidade'] += 2
-
-    me = dados.get('margem_ebit')
-    if me:
-        if me >= 20: score['qualidade'] += 5
-        elif me >= 10: score['qualidade'] += 3
-
-    # VALUATION (30pts)
-    pl = dados.get('pl')
-    pvp = dados.get('pvp')
-    dy = dados.get('div_yield')
-    cr = dados.get('crescimento_receita') or 0
-    empresa_crescimento = roic and roic >= 15 and cr >= 15
-    score['empresa_crescimento'] = empresa_crescimento
-
-    if pl and pl > 0:
-        if empresa_crescimento:
-            peg = pl / max(cr, 1)
-            if peg < 1: score['valuation'] += 15
-            elif peg < 1.5: score['valuation'] += 10
-            elif peg < 2: score['valuation'] += 5
-        else:
-            if pl < 8: score['valuation'] += 15
-            elif pl < 15: score['valuation'] += 10
-            elif pl < 25: score['valuation'] += 5
-
-    if pvp:
-        if pvp < 1: score['valuation'] += 10
-        elif pvp < 2: score['valuation'] += 6
-        elif pvp < 3: score['valuation'] += 2
-
-    if dy:
-        if dy >= 8: score['valuation'] += 5
-        elif dy >= 5: score['valuation'] += 3
-        elif dy >= 3: score['valuation'] += 1
-
-    # CRESCIMENTO (20pts)
-    if cr:
-        if cr >= 20: score['crescimento'] += 15
-        elif cr >= 10: score['crescimento'] += 10
-        elif cr >= 5: score['crescimento'] += 5
-    mb = dados.get('margem_bruta')
-    if mb and mb >= 30: score['crescimento'] += 5
-
-    # SOLIDEZ (10pts)
-    if eh_banco:
-        if roe and roe >= 15: score['solidez'] += 5
-        if ml and ml >= 20: score['solidez'] += 5
-    else:
-        db = dados.get('divida_bruta_patrim')
-        if db is not None:
-            if db < 0.3: score['solidez'] += 5
-            elif db < 1: score['solidez'] += 3
-            elif db < 2: score['solidez'] += 1
-        lc = dados.get('liquidez_corrente')
-        if lc:
-            if lc >= 2: score['solidez'] += 5
-            elif lc >= 1.5: score['solidez'] += 3
-            elif lc >= 1: score['solidez'] += 1
-
-    score['qualidade']   = min(score['qualidade'], 40)
-    score['valuation']   = min(score['valuation'], 30)
-    score['crescimento'] = min(score['crescimento'], 20)
-    score['solidez']     = min(score['solidez'], 10)
-    score['total'] = score['qualidade'] + score['valuation'] + score['crescimento'] + score['solidez']
-    return score
-
-def gerar_alertas_inteligentes(dados, ticker):
-    oportunidades = []
-    bandeiras = []
-    pl = dados.get('pl'); pvp = dados.get('pvp'); roe = dados.get('roe')
-    dy = dados.get('div_yield'); cr = dados.get('crescimento_receita')
-    db = dados.get('divida_bruta_patrim'); ml = dados.get('margem_liquida')
-    roic = dados.get('roic')
-
-    if pl and 0 < pl < 8:
-        oportunidades.append(f"💎 P/L muito baixo ({pl:.1f}) - Possível subvalorização")
-    if pvp and pvp < 1:
-        oportunidades.append(f"📊 P/VP abaixo de 1 ({pvp:.2f}) - Ativo abaixo do patrimônio")
-    if roe and roe >= 20:
-        oportunidades.append(f"🚀 ROE excepcional ({roe:.1f}%) - Alta rentabilidade!")
-    if dy and dy >= 8:
-        oportunidades.append(f"💰 Dividend Yield atrativo ({dy:.1f}%) - Renda passiva")
-    if cr and cr >= 15:
-        oportunidades.append(f"📈 Crescimento forte ({cr:.1f}% a.a.) - Empresa em expansão")
-    if roic and roic >= 20:
-        oportunidades.append(f"⭐ ROIC excelente ({roic:.1f}%) - Retorno superior ao capital")
-
-    if pl and pl > 40:
-        bandeiras.append(f"⚠️ P/L muito alto ({pl:.1f}) - Risco de sobrevalorização")
-    if db and db > 3:
-        bandeiras.append(f"🚨 Dívida elevada ({db:.1f}x patrimônio)")
-    if ml and ml < 0:
-        bandeiras.append(f"❌ Margem líquida negativa ({ml:.1f}%) - Empresa dando prejuízo")
-    if cr and cr < -10:
-        bandeiras.append(f"📉 Queda de receita ({cr:.1f}%) - Negócio em retração")
-
-    return {'oportunidades': oportunidades, 'bandeiras_vermelhas': bandeiras}
-
-def simulacao_investimento(ticker_yf, valor_inicial=1000.0, ano_inicio=2019):
-    try:
-        acao = yf.Ticker(ticker_yf)
-        data_inicio = f"{ano_inicio}-01-01"
-        hist = acao.history(start=data_inicio, auto_adjust=True)
-        if hist.empty or len(hist) < 10:
-            return None
-        dividendos = acao.history(start=data_inicio, auto_adjust=True)['Dividends']
-        dividendos = dividendos[dividendos > 0]
-
-        preco_entrada = hist['Close'].iloc[0]
-        preco_atual   = hist['Close'].iloc[-1]
-        data_entrada  = hist.index[0].strftime('%d/%m/%Y')
-
-        acoes_iniciais = valor_inicial / preco_entrada
-        acoes_com_reinv = acoes_iniciais
-        total_reinvestido = 0.0
-        historico_divs = []
-
-        for data, div_por_acao in dividendos.items():
-            if div_por_acao <= 0: continue
-            try:
-                preco_na_data = hist['Close'].asof(data)
-                if pd.isna(preco_na_data) or preco_na_data <= 0: continue
-                recebido = acoes_com_reinv * div_por_acao
-                novas_acoes = recebido / preco_na_data
-                acoes_com_reinv += novas_acoes
-                total_reinvestido += recebido
-                historico_divs.append({
-                    'data': data.strftime('%m/%Y'),
-                    'valor_unit': div_por_acao,
-                    'recebido': recebido
-                })
-            except: continue
-
-        valor_com_reinv     = acoes_com_reinv * preco_atual
-        valor_sem_reinv     = acoes_iniciais  * preco_atual
-        ganho_reinvestimento = valor_com_reinv - valor_sem_reinv
-
-        anos = max((datetime.now() - hist.index[0].to_pydatetime().replace(tzinfo=None)).days / 365.25, 0.1)
-        cagr_sem = ((valor_sem_reinv / valor_inicial) ** (1 / anos) - 1) * 100
-        cagr_com = ((valor_com_reinv / valor_inicial) ** (1 / anos) - 1) * 100
-
-        return {
-            'preco_entrada': preco_entrada, 'preco_atual': preco_atual,
-            'data_entrada': data_entrada,
-            'acoes_iniciais': acoes_iniciais, 'acoes_com_reinv': acoes_com_reinv,
-            'valor_sem_reinv_total': valor_sem_reinv,
-            'valor_com_reinv': valor_com_reinv,
-            'ganho_reinvestimento': ganho_reinvestimento,
-            'total_reinvestido': total_reinvestido,
-            'retorno_sem': ((valor_sem_reinv / valor_inicial) - 1) * 100,
-            'retorno_com': ((valor_com_reinv  / valor_inicial) - 1) * 100,
-            'cagr_sem': cagr_sem, 'cagr_com': cagr_com,
-            'num_dividendos': len(historico_divs),
-            'historico_dividendos': historico_divs,
-            'anos': round(anos, 1)
-        }
-    except Exception as e:
-        print(f"[ERRO] simulacao_investimento: {e}")
-        return None
-
-# ══════════════════════════════════════════════════════════════
-#  GERADOR DE HTML DO RELATÓRIO
-# ══════════════════════════════════════════════════════════════
-
-def gerar_html_relatorio(ticker, dados, scores, insights, sim,
-                         preco_justo=None, preco_teto=None,
-                         variacao_3m=None, acima_ema50=None):
-
-    def cor(val, bom, ok, inv=False):
-        if val is None: return 'neutral'
-        if inv: return 'green' if val<=bom else ('yellow' if val<=ok else 'red')
-        return 'green' if val>=bom else ('yellow' if val>=ok else 'red')
-
-    def fmt(val, d=2, s=''):
-        return f'{val:.{d}f}{s}' if val is not None else '—'
-
-    def fmt_bi(val):
-        if val is None: return '—'
-        if abs(val) >= 1e9: return f'R$ {val/1e9:.2f} bi'
-        if abs(val) >= 1e6: return f'R$ {val/1e6:.0f} M'
-        return f'R$ {val:.0f}'
-
-    def card(label, valor, cls='neutral'):
-        return f'<div class="ind-card {cls}"><div class="ind-label">{label}</div><div class="ind-value">{valor}</div></div>'
-
-    def barra(v, mx, cor_barra):
-        pct = min((v/mx)*100, 100)
-        return f'<div class="score-bar-fill" style="width:{pct}%;background:{cor_barra}"></div>'
-
-    score_total = scores['total']
-    if score_total >= 80:   slabel, scolor = 'EXCELENTE', '#00ff88'
-    elif score_total >= 65: slabel, scolor = 'MUITO BOM', '#4da6ff'
-    elif score_total >= 50: slabel, scolor = 'BOM',       '#ffd700'
-    elif score_total >= 35: slabel, scolor = 'REGULAR',   '#ff9900'
-    else:                   slabel, scolor = 'FRACO',     '#ff4444'
-
-    eh_banco = scores.get('eh_banco', False)
-    ticker_clean = ticker.replace('.SA','')
-    now = datetime.now().strftime('%d/%m/%Y %H:%M')
-
-    # VALUATION
-    val_html = ''
-    if preco_justo and dados.get('cotacao'):
-        cot = dados['cotacao']
-        dj  = ((preco_justo - cot)/cot)*100
-        dt  = ((preco_teto  - cot)/cot)*100 if preco_teto else None
-        if cot < preco_justo*0.7:   sv, cv = 'MUITO SUBVALORIZADA', '#00ff88'
-        elif cot < preco_justo*0.9: sv, cv = 'SUBVALORIZADA',       '#00cc66'
-        elif cot < preco_justo*1.1: sv, cv = 'PREÇO JUSTO',         '#ffd700'
-        elif cot < preco_justo*1.3: sv, cv = 'LEVEMENTE CARA',      '#ff9900'
-        else:                       sv, cv = 'SOBREVALORIZADA',      '#ff4444'
-        vmax    = max(cot, preco_justo, preco_teto or 0)*1.15
-        pc      = (cot/vmax)*100
-        pj      = (preco_justo/vmax)*100
-        pt_html = f'<div class="vbar-marker teto" style="left:{(preco_teto/vmax)*100:.1f}%"></div>' if preco_teto else ''
-        dt_html = ''
-        if dt is not None:
-            cc = '#00ff88' if dt>0 else '#ff4444'
-            dt_html = f'<div class="val-item"><span>Preço Teto</span><strong>R$ {preco_teto:.2f}</strong><span style="color:{cc}">{dt:+.1f}%</span></div>'
-        val_html = f'''<div class="section">
-          <div class="section-title">💎 VALUATION</div>
-          <div class="val-status" style="color:{cv}">{sv}</div>
-          <div class="vbar-wrap"><div class="vbar-track">
-            <div class="vbar-fill" style="width:{pc:.1f}%;background:{cv}"></div>
-            <div class="vbar-marker justo" style="left:{pj:.1f}%"></div>
-            {pt_html}<div class="vbar-cotacao" style="left:{pc:.1f}%">▼</div>
-          </div></div>
-          <div class="val-items">
-            <div class="val-item"><span>Cotação</span><strong>R$ {cot:.2f}</strong></div>
-            <div class="val-item"><span>Preço Justo</span><strong>R$ {preco_justo:.2f}</strong>
-              <span style="color:{'#00ff88' if dj>0 else '#ff4444'}">{dj:+.1f}%</span></div>
-            {dt_html}
-          </div></div>'''
-
-    # SIMULAÇÃO
-    sim_html = ''
-    if sim:
-        chart_bars = ''
-        if sim['historico_dividendos']:
-            max_r = max(d['recebido'] for d in sim['historico_dividendos'])
-            for d in sim['historico_dividendos']:
-                h    = (d['recebido']/max_r)*100 if max_r>0 else 0
-                tipo = 'JCP' if d['valor_unit']<0.05 else 'DIV'
-                ct   = '#ffd700' if tipo=='JCP' else '#00ff88'
-                chart_bars += f'<div class="div-bar-wrap"><div class="div-bar-val">R${d["recebido"]:.0f}</div><div class="div-bar-col"><div class="div-bar-fill" style="height:{h:.0f}%;background:{ct}"></div></div><div class="div-bar-date">{d["data"]}</div><div class="div-bar-tipo" style="color:{ct}">{tipo}</div></div>'
-        gc = '#00ff88' if sim['ganho_reinvestimento']>0 else '#ff4444'
-        cs = '#00ff88' if sim['retorno_sem']>0 else '#ff4444'
-        sim_html = f'''<div class="section" id="sim-section">
-          <div class="section-title">💸 SIMULAÇÃO
-            <span class="sim-controls">
-              R$<input type="number" id="sim-valor" value="1000" min="100" step="100">
-              em <input type="number" id="sim-ano" value="2019" min="2010" max="2024" step="1">
-              <button onclick="recalcularSim()">▶ RECALCULAR</button>
-              <span id="sim-status"></span>
-            </span>
-          </div>
-          <div id="sim-content">
-            <div class="sim-grid">
-              <div class="sim-card"><div class="sim-label">📦 Sem reinvestimento</div>
-                <div class="sim-value">R$ {sim["valor_sem_reinv_total"]:,.2f}</div>
-                <div class="sim-ret" style="color:{cs}">{sim["retorno_sem"]:+.1f}%</div>
-                <div class="sim-sub">CAGR {sim["cagr_sem"]:.1f}% a.a.</div></div>
-              <div class="sim-card highlight"><div class="sim-label">🔄 Com reinvestimento</div>
-                <div class="sim-value">R$ {sim["valor_com_reinv"]:,.2f}</div>
-                <div class="sim-ret" style="color:#00ff88">{sim["retorno_com"]:+.1f}%</div>
-                <div class="sim-sub">CAGR {sim["cagr_com"]:.1f}% a.a.</div></div>
-              <div class="sim-card"><div class="sim-label">⚡ Ganho do reinvestimento</div>
-                <div class="sim-value" style="color:{gc}">R$ {sim["ganho_reinvestimento"]:,.2f}</div>
-                <div class="sim-ret" style="color:{gc}">{sim["retorno_com"]-sim["retorno_sem"]:+.1f}%</div>
-                <div class="sim-sub">{sim["num_dividendos"]} pagamentos · {sim["acoes_iniciais"]:.1f}→{sim["acoes_com_reinv"]:.1f} ações</div></div>
-            </div>
-            <div class="sim-meta">Entrada {sim["data_entrada"]} · preço ajustado R$ {sim["preco_entrada"]:.2f} → R$ {sim["preco_atual"]:.2f} hoje</div>
-            <div class="div-chart" id="div-chart-bars">{chart_bars}</div>
-          </div></div>'''
-
-    # OPORTUNIDADES / ALERTAS
-    oport_html = ''
-    if insights['oportunidades']:
-        itens = ''.join(f'<li class="oport-item">{o}</li>' for o in insights['oportunidades'])
-        oport_html = f'<div class="section oport-section"><div class="section-title">🌟 OPORTUNIDADES</div><ul>{itens}</ul></div>'
-    band_html = ''
-    if insights['bandeiras_vermelhas']:
-        itens = ''.join(f'<li class="band-item">{b}</li>' for b in insights['bandeiras_vermelhas'])
-        band_html = f'<div class="section band-section"><div class="section-title">🚨 ALERTAS</div><ul>{itens}</ul></div>'
-
-    # OSCILAÇÕES
-    osc = dados.get('oscilacoes', {})
-    def osc_cell(label, chave):
-        v = osc.get(chave)
-        if v is None: return ''
-        c = '#00ff88' if v>0 else '#ff4444'
-        return f'<div class="osc-item"><span class="osc-label">{label}</span><span class="osc-val" style="color:{c}">{v:+.1f}%</span></div>'
-    osc_html = f'''<div class="section"><div class="section-title">📊 OSCILAÇÕES</div><div class="osc-grid">
-        {osc_cell("Dia","dia")}{osc_cell("Mês","mes")}{osc_cell("30d","30_dias")}{osc_cell("12m","12_meses")}
-        {osc_cell("2026","2026")}{osc_cell("2025","2025")}{osc_cell("2024","2024")}{osc_cell("2023","2023")}{osc_cell("2022","2022")}
-    </div></div>'''
-
-    # TÉCNICA
-    tec_html = ''
-    if variacao_3m is not None or acima_ema50 is not None:
-        cv2 = '#00ff88' if (variacao_3m or 0)>0 else '#ff4444'
-        et  = '✅ Acima EMA50' if acima_ema50 else '❌ Abaixo EMA50'
-        ec  = '#00ff88' if acima_ema50 else '#ff4444'
-        tec_html = f'''<div class="section"><div class="section-title">📈 TÉCNICA</div><div class="tec-grid">
-          <div class="ind-card neutral"><div class="ind-label">Var. 3 meses</div><div class="ind-value" style="color:{cv2}">{fmt(variacao_3m,1,'%')}</div></div>
-          <div class="ind-card neutral"><div class="ind-label">Tendência</div><div class="ind-value" style="color:{ec};font-size:0.8rem">{et}</div></div>
-        </div></div>'''
-
-    # CLASSIFICAÇÃO
-    if score_total >= 80:   ctxt = '⭐ COMPRA FORTE — EXCELENTE OPORTUNIDADE'
-    elif score_total >= 65: ctxt = '💎 COMPRA — MUITO BOA EMPRESA'
-    elif score_total >= 50: ctxt = '✓ CONSIDERAR — BOA EMPRESA'
-    elif score_total >= 35: ctxt = '⚠ CAUTELA — EMPRESA REGULAR'
-    else:                   ctxt = '❌ EVITAR — EMPRESA FRACA'
-
-    return f'''<!DOCTYPE html>
+"""
+QUANTTECH VALOR JUSTO
+Execute: python quanttech.py
+Acesse:  http://localhost:8765
+Sem necessidade de chave de API!
+"""
+
+import json, re, threading, webbrowser, math
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+
+PORT = 8765
+
+HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚛️ QUANTTECH — {ticker_clean}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuantTech · Valor Justo</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
-  :root{{--bg:#0a0c10;--bg2:#111318;--bg3:#1a1d24;--border:#2a2d36;
-    --green:#00ff88;--red:#ff4455;--yellow:#ffd700;--cyan:#00e5ff;
-    --text:#e8eaf0;--muted:#6b7280;--accent:{scolor};}}
-  *{{box-sizing:border-box;margin:0;padding:0;}}
-  body{{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.4;}}
-  .header{{background:linear-gradient(135deg,#0d1117,#111827,#0d1117);border-bottom:1px solid var(--border);
-    padding:8px 16px;display:flex;align-items:center;justify-content:space-between;
-    position:sticky;top:0;z-index:100;gap:12px;flex-wrap:wrap;}}
-  .header-left{{display:flex;align-items:center;gap:10px;}}
-  .brand-name{{font-family:'Syne',sans-serif;font-size:1.15rem;font-weight:800;color:var(--cyan);letter-spacing:3px;}}
-  .brand-sub{{font-size:0.55rem;color:var(--muted);letter-spacing:2px;}}
-  .divider-v{{width:1px;height:28px;background:var(--border);}}
-  .header-ticker{{font-family:'Syne',sans-serif;font-size:1.5rem;font-weight:800;color:var(--accent);}}
-  .header-info{{display:flex;flex-direction:column;}}
-  .header-name{{font-size:0.7rem;color:var(--muted);}}
-  .header-setor{{font-size:0.65rem;color:var(--cyan);}}
-  .header-right{{display:flex;align-items:center;gap:12px;}}
-  .header-cotacao{{font-family:'Syne',sans-serif;font-size:1.35rem;font-weight:700;color:var(--text);}}
-  .header-date{{font-size:0.6rem;color:var(--muted);}}
-  .search-bar{{display:flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:4px 8px;}}
-  .search-bar input{{background:transparent;border:none;outline:none;color:var(--text);
-    font-family:'JetBrains Mono',monospace;font-size:0.75rem;width:80px;text-transform:uppercase;}}
-  .search-bar input::placeholder{{color:var(--muted);}}
-  .search-bar button{{background:var(--accent);color:#000;border:none;border-radius:4px;
-    padding:3px 8px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.65rem;}}
-  #search-status{{font-size:0.6rem;color:var(--muted);min-width:70px;}}
-  .container{{max-width:1280px;margin:0 auto;padding:10px 14px;display:grid;grid-template-columns:240px 1fr;gap:10px;}}
-  .sidebar{{display:flex;flex-direction:column;gap:8px;}}
-  .main   {{display:flex;flex-direction:column;gap:8px;}}
-  .section{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;}}
-  .section-title{{font-family:'Syne',sans-serif;font-size:0.6rem;font-weight:700;
-    letter-spacing:2px;text-transform:uppercase;color:var(--muted);
-    margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border);
-    display:flex;align-items:center;gap:8px;flex-wrap:wrap;}}
-  .score-main{{background:linear-gradient(135deg,var(--bg2),#161920);
-    border:1px solid var(--accent);border-radius:8px;padding:12px;text-align:center;}}
-  .score-number{{font-family:'Syne',sans-serif;font-size:2.6rem;font-weight:800;color:var(--accent);line-height:1;}}
-  .score-label{{font-size:0.65rem;font-weight:700;color:var(--accent);letter-spacing:3px;margin-top:2px;}}
-  .score-sub{{font-size:0.6rem;color:var(--muted);}}
-  .score-cats{{display:flex;flex-direction:column;gap:6px;}}
-  .score-cat-row{{display:grid;grid-template-columns:65px 1fr 42px;align-items:center;gap:6px;font-size:0.65rem;}}
-  .score-cat-name{{color:var(--muted);}}
-  .score-bar-track{{background:var(--bg3);border-radius:3px;height:5px;overflow:hidden;border:1px solid var(--border);}}
-  .score-bar-fill{{height:100%;border-radius:3px;}}
-  .score-cat-val{{text-align:right;color:var(--text);font-weight:600;font-size:0.6rem;}}
-  .score-cat-note{{font-size:0.55rem;color:var(--cyan);grid-column:2/4;margin-top:-3px;}}
-  .ind-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:6px;}}
-  .ind-card{{background:var(--bg3);border-radius:6px;padding:6px 8px;border-left:2px solid var(--border);}}
-  .ind-card.green {{border-left-color:var(--green);}} .ind-card.yellow{{border-left-color:var(--yellow);}} .ind-card.red{{border-left-color:var(--red);}}
-  .ind-label{{font-size:0.55rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}}
-  .ind-value{{font-size:0.88rem;font-weight:700;color:var(--text);margin-top:1px;}}
-  .ind-card.green .ind-value{{color:var(--green);}} .ind-card.yellow .ind-value{{color:var(--yellow);}} .ind-card.red .ind-value{{color:var(--red);}}
-  .val-status{{font-family:'Syne',sans-serif;font-size:0.85rem;font-weight:700;margin-bottom:8px;}}
-  .vbar-wrap{{margin:6px 0 10px;}}
-  .vbar-track{{position:relative;height:12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);overflow:visible;}}
-  .vbar-fill{{height:100%;border-radius:6px;opacity:0.7;}}
-  .vbar-marker{{position:absolute;top:-4px;width:2px;height:20px;border-radius:2px;}}
-  .vbar-marker.justo{{background:var(--cyan);}} .vbar-marker.teto{{background:var(--yellow);}}
-  .vbar-cotacao{{position:absolute;top:-16px;transform:translateX(-50%);font-size:0.75rem;color:var(--text);}}
-  .val-items{{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;}}
-  .val-item{{display:flex;flex-direction:column;gap:1px;}}
-  .val-item span{{font-size:0.55rem;color:var(--muted);}} .val-item strong{{font-size:0.8rem;color:var(--text);}}
-  .sim-controls{{display:flex;align-items:center;gap:5px;margin-left:auto;flex-wrap:wrap;}}
-  .sim-controls input{{background:var(--bg3);border:1px solid var(--border);color:var(--text);
-    border-radius:4px;padding:2px 5px;font-family:'JetBrains Mono',monospace;font-size:0.65rem;width:55px;}}
-  .sim-controls button{{background:var(--accent);color:#000;border:none;border-radius:4px;
-    padding:2px 7px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.6rem;}}
-  #sim-status{{font-size:0.6rem;color:var(--yellow);}}
-  .sim-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px;}}
-  .sim-card{{background:var(--bg3);border-radius:6px;padding:8px;border:1px solid var(--border);text-align:center;}}
-  .sim-card.highlight{{border-color:var(--green);background:rgba(0,255,136,0.05);}}
-  .sim-label{{font-size:0.6rem;color:var(--muted);margin-bottom:4px;}}
-  .sim-value{{font-size:0.95rem;font-weight:700;color:var(--text);}}
-  .sim-ret{{font-size:0.75rem;font-weight:600;margin-top:2px;}}
-  .sim-sub{{font-size:0.55rem;color:var(--muted);margin-top:2px;}}
-  .sim-meta{{font-size:0.58rem;color:var(--muted);margin-bottom:10px;padding:4px 8px;
-    background:var(--bg3);border-radius:4px;border:1px solid var(--border);}}
-  .div-chart{{display:flex;align-items:flex-end;gap:3px;height:80px;padding:0 2px;overflow-x:auto;}}
-  .div-bar-wrap{{display:flex;flex-direction:column;align-items:center;gap:1px;min-width:40px;flex-shrink:0;}}
-  .div-bar-val{{font-size:0.5rem;color:var(--muted);white-space:nowrap;}}
-  .div-bar-col{{width:24px;height:50px;display:flex;align-items:flex-end;}}
-  .div-bar-fill{{width:100%;border-radius:2px 2px 0 0;min-height:2px;}}
-  .div-bar-date{{font-size:0.5rem;color:var(--muted);}} .div-bar-tipo{{font-size:0.5rem;font-weight:700;}}
-  .osc-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(85px,1fr));gap:5px;}}
-  .osc-item{{background:var(--bg3);border-radius:5px;padding:4px 6px;display:flex;justify-content:space-between;align-items:center;border:1px solid var(--border);}}
-  .osc-label{{font-size:0.6rem;color:var(--muted);}} .osc-val{{font-size:0.75rem;font-weight:700;}}
-  .oport-section{{border-color:rgba(0,255,136,0.3);}} .band-section{{border-color:rgba(255,68,85,0.3);}}
-  .oport-section .section-title{{color:var(--green);}} .band-section .section-title{{color:var(--red);}}
-  .oport-item,.band-item{{list-style:none;padding:4px 7px;border-radius:4px;margin-bottom:3px;font-size:0.7rem;}}
-  .oport-item{{background:rgba(0,255,136,0.07);color:var(--green);}}
-  .band-item{{background:rgba(255,68,85,0.07);color:var(--red);}}
-  .class-final{{background:linear-gradient(135deg,rgba(255,255,255,0.02),var(--bg2));
-    border:1px solid var(--accent);border-radius:8px;padding:14px;text-align:center;grid-column:1/-1;}}
-  .class-txt{{font-family:'Syne',sans-serif;font-size:1.05rem;font-weight:800;color:var(--accent);letter-spacing:1px;}}
-  .class-sub{{font-size:0.6rem;color:var(--muted);margin-top:4px;}}
-  .tec-grid{{display:grid;grid-template-columns:1fr 1fr;gap:6px;}}
-  .footer{{text-align:center;padding:10px;font-size:0.55rem;color:var(--muted);border-top:1px solid var(--border);}}
-  @media(max-width:860px){{.container{{grid-template-columns:1fr;}}.sim-grid{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root{
+  --cream:#f4f7fc;--paper:#ffffff;--ink:#0a0f1e;--ink2:#1e2a3a;
+  --ink3:#4a6080;--ink4:#8a9ab0;--gold:#c8960c;--gold2:#e8b420;
+  --green:#0d5c2e;--green2:#22c55e;--red:#7a1010;--red2:#ef4444;
+  --blue:#0047cc;--blue2:#3b82f6;--border:#dde4ef;--shadow:rgba(10,15,30,0.08);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--cream);color:var(--ink);font-family:'DM Sans',sans-serif;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 70% 40% at 10% 0%,rgba(0,71,204,.06),transparent 60%),
+    radial-gradient(ellipse 50% 35% at 90% 100%,rgba(13,92,46,.04),transparent 60%)}
+.page{max-width:740px;margin:0 auto;padding:28px 16px 80px;position:relative;z-index:1}
+
+/* ── Masthead ── */
+.masthead{text-align:center;padding:36px 0 28px;margin-bottom:32px;position:relative}
+.masthead::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);
+  width:100px;height:3px;background:linear-gradient(90deg,var(--blue2),var(--gold2));border-radius:2px}
+.brand-row{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;margin-bottom:12px}
+.brand-icon{width:54px;height:54px;
+  background:linear-gradient(135deg,#0047cc,#3b82f6);
+  border-radius:14px;display:flex;align-items:center;justify-content:center;
+  font-size:16px;font-family:'DM Mono',monospace;font-weight:700;color:#fff;
+  letter-spacing:-1px;box-shadow:0 4px 20px rgba(0,71,204,.25)}
+.brand-text{text-align:left}
+.brand-quant{font-family:'DM Mono',monospace;font-size:13px;letter-spacing:3px;
+  color:var(--blue2);font-weight:800;display:flex;align-items:center;gap:8px}
+.brand-star{font-size:16px;line-height:1}
+.brand-trading{color:var(--ink4);font-weight:400;letter-spacing:1px;font-size:11px}
+.brand-title{font-family:'DM Serif Display',serif;font-size:clamp(28px,6vw,40px);
+  line-height:1;color:var(--ink);letter-spacing:-1px;text-align:center}
+.brand-title em{color:var(--gold);font-style:italic}
+.brand-sub{font-size:13px;color:var(--ink3);margin-top:10px;font-weight:300}
+.live-badge{display:inline-flex;align-items:center;gap:6px;
+  background:var(--ink);color:#fff;border-radius:20px;
+  padding:5px 14px;margin-top:12px;
+  font-family:'DM Mono',monospace;font-size:10px;letter-spacing:2px}
+.live-dot{width:6px;height:6px;background:var(--green2);border-radius:50%;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.6)}}
+
+/* ── Search ── */
+.search-card{background:var(--ink);border-radius:12px 12px 0 0;padding:28px 24px;
+  margin-bottom:0;box-shadow:0 12px 40px rgba(10,15,30,.2);position:relative;overflow:hidden}
+.search-card::before{content:'';position:absolute;top:-50px;right:-50px;
+  width:200px;height:200px;pointer-events:none;
+  background:radial-gradient(circle,rgba(59,130,246,.15),transparent 70%)}
+.search-card::after{content:'';position:absolute;bottom:-40px;left:-40px;
+  width:160px;height:160px;pointer-events:none;
+  background:radial-gradient(circle,rgba(232,180,32,.1),transparent 70%)}
+.s-label{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:rgba(255,255,255,.4);margin-bottom:12px}
+.s-row{display:flex;gap:10px;position:relative;z-index:1}
+.ticker-input{flex:1;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.15);border-radius:8px;
+  padding:14px 20px;font-family:'DM Serif Display',serif;font-size:28px;
+  color:#fff;outline:none;letter-spacing:3px;text-transform:uppercase;
+  transition:border-color .2s,box-shadow .2s}
+.ticker-input::placeholder{color:rgba(255,255,255,.2);font-size:20px;letter-spacing:1px}
+.ticker-input:focus{border-color:var(--gold2);box-shadow:0 0 0 3px rgba(232,180,32,.15)}
+.btn-analisar{background:linear-gradient(135deg,var(--gold),var(--gold2));
+  color:var(--ink);border:none;border-radius:8px;
+  padding:14px 28px;font-family:'DM Serif Display',serif;font-size:18px;
+  cursor:pointer;transition:all .2s;white-space:nowrap;
+  box-shadow:0 4px 16px rgba(200,150,12,.3)}
+.btn-analisar:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(200,150,12,.4)}
+.btn-analisar:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.s-hint{margin-top:10px;font-family:'DM Mono',monospace;font-size:11px;
+  color:rgba(255,255,255,.3);letter-spacing:1px;position:relative;z-index:1}
+
+/* ── Loading ── */
+.loading{display:none;background:var(--paper);border:1px solid var(--border);
+  border-radius:12px;padding:48px 24px;margin-bottom:24px;text-align:center;
+  box-shadow:0 4px 20px var(--shadow)}
+.loading.on{display:block}
+.spinner{width:48px;height:48px;border:3px solid var(--border);
+  border-top-color:var(--blue2);border-radius:50%;
+  animation:spin .8s linear infinite;margin:0 auto 20px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.l-title{font-family:'DM Serif Display',serif;font-size:22px;color:var(--ink2);margin-bottom:6px}
+.l-sub{font-size:13px;color:var(--ink4)}
+
+/* ── Error ── */
+.error{display:none;background:#fff5f5;border:1.5px solid var(--red2);
+  border-radius:10px;padding:18px 20px;margin-bottom:20px;
+  color:var(--red);font-size:13px;line-height:1.6}
+.error.on{display:block}
+
+/* ── Dados card ── */
+.dados-card{display:none;background:var(--paper);border:1px solid var(--border);
+  border-radius:12px;overflow:hidden;margin-bottom:20px;
+  animation:up .4s ease;box-shadow:0 4px 20px var(--shadow)}
+.dados-card.on{display:block}
+@keyframes up{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+.dados-header{display:flex;align-items:center;justify-content:space-between;
+  padding:18px 22px;background:linear-gradient(135deg,var(--ink),var(--ink2));
+  border-bottom:1px solid var(--border)}
+.dh-left{display:flex;align-items:center;gap:12px}
+.dh-icon{width:40px;height:40px;background:linear-gradient(135deg,var(--blue),var(--blue2));
+  border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.d-ticker{font-family:'DM Serif Display',serif;font-size:24px;color:#fff}
+.d-empresa{font-size:11px;color:rgba(255,255,255,.5);margin-top:2px;font-weight:300}
+.fonte-tag{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:1px;
+  background:rgba(255,255,255,.1);color:rgba(255,255,255,.6);
+  padding:4px 10px;border-radius:20px;border:1px solid rgba(255,255,255,.15)}
+.dados-grid{display:grid;grid-template-columns:repeat(3,1fr)}
+.dado{padding:16px 18px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.dado:nth-child(3n){border-right:none}
+.dado:nth-last-child(-n+3){border-bottom:none}
+.d-lbl{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:2px;
+  color:var(--ink4);margin-bottom:5px}
+.d-val{font-family:'DM Serif Display',serif;font-size:20px;color:var(--ink)}
+.pos{color:var(--green)}.neg{color:var(--red2)}.gld{color:var(--gold)}
+
+/* ── Resultado ── */
+#result{display:none}
+
+.verdict{border-radius:12px;padding:28px 26px;margin-bottom:20px;
+  position:relative;overflow:hidden;animation:up .4s ease;
+  box-shadow:0 4px 20px var(--shadow)}
+.verdict.buy{background:linear-gradient(135deg,#f0faf4,#e8f8f0);border:2px solid var(--green2)}
+.verdict.hold{background:linear-gradient(135deg,#fffbf0,#fff8e8);border:2px solid var(--gold2)}
+.verdict.avoid{background:linear-gradient(135deg,#fff5f5,#ffeaea);border:2px solid var(--red2)}
+.v-eye{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;margin-bottom:8px}
+.verdict.buy .v-eye{color:var(--green)}.verdict.hold .v-eye{color:var(--gold)}.verdict.avoid .v-eye{color:var(--red)}
+.v-title{font-family:'DM Serif Display',serif;font-size:clamp(22px,5vw,34px);
+  line-height:1.1;margin-bottom:12px}
+.verdict.buy .v-title{color:var(--green)}.verdict.hold .v-title{color:var(--gold)}.verdict.avoid .v-title{color:var(--red)}
+.v-text{font-size:14px;color:var(--ink2);line-height:1.7;font-weight:300}
+.v-score{position:absolute;top:20px;right:24px;font-family:'DM Serif Display',serif;
+  font-size:72px;opacity:.07;line-height:1}
+
+/* ── Pills ── */
+.pills{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;animation:up .4s .06s ease both}
+.pill{flex:1;min-width:110px;background:var(--paper);border:1px solid var(--border);
+  border-radius:10px;padding:14px 12px;text-align:center;
+  box-shadow:0 2px 8px var(--shadow)}
+.p-lbl{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:2px;
+  color:var(--ink4);margin-bottom:5px}
+.p-val{font-family:'DM Serif Display',serif;font-size:22px}
+.p-sub{font-size:10px;color:var(--ink4);margin-top:2px}
+
+/* ── Gauge ── */
+.gauge-card{background:var(--paper);border:1px solid var(--border);border-radius:12px;
+  padding:22px;margin-bottom:20px;animation:up .4s .1s ease both;
+  box-shadow:0 2px 8px var(--shadow)}
+.g-lbl{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:var(--ink3);margin-bottom:16px}
+.g-track{height:12px;background:var(--border);border-radius:12px;
+  position:relative;margin-bottom:10px}
+.g-fill{height:100%;border-radius:12px;
+  background:linear-gradient(90deg,var(--red2),var(--gold2),var(--green2));
+  transition:width .9s cubic-bezier(.4,0,.2,1)}
+.g-pin{position:absolute;top:-5px;width:22px;height:22px;
+  background:var(--ink);border:3px solid white;border-radius:50%;
+  transform:translateX(-50%);transition:left .9s cubic-bezier(.4,0,.2,1);
+  box-shadow:0 2px 8px var(--shadow)}
+.g-labs{display:flex;justify-content:space-between;
+  font-family:'DM Mono',monospace;font-size:9px;color:var(--ink4);letter-spacing:1px}
+
+/* ── Preço Justo ── */
+.preco-card{background:linear-gradient(135deg,var(--ink),var(--ink2));
+  color:#fff;border-radius:12px;padding:26px;margin-bottom:20px;
+  animation:up .4s .14s ease both;box-shadow:0 6px 24px rgba(10,15,30,.2)}
+.pc-lbl{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:rgba(255,255,255,.4);margin-bottom:18px}
+.pc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.pc-il{font-size:9px;font-family:'DM Mono',monospace;letter-spacing:1px;
+  color:rgba(255,255,255,.4);margin-bottom:5px}
+.pc-iv{font-family:'DM Serif Display',serif;font-size:22px;color:#fff}
+.pc-is{font-size:10px;color:rgba(255,255,255,.3);margin-top:3px}
+.pc-bottom{border-top:1px solid rgba(255,255,255,.1);
+  margin-top:18px;padding-top:18px;
+  display:flex;justify-content:space-between;align-items:center}
+
+/* ── Análise Textual ── */
+.analise-card{background:var(--paper);border:1px solid var(--border);
+  border-radius:12px;overflow:hidden;margin-bottom:20px;
+  animation:up .4s .16s ease both;box-shadow:0 2px 8px var(--shadow)}
+.analise-hdr{padding:14px 22px;border-bottom:1px solid var(--border);
+  background:linear-gradient(135deg,#f8faff,var(--cream));
+  font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;color:var(--ink3)}
+.analise-body{padding:20px 22px}
+.analise-section{margin-bottom:16px}
+.analise-section:last-child{margin-bottom:0}
+.a-label{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:2px;
+  color:var(--blue2);margin-bottom:5px;text-transform:uppercase}
+.a-text{font-size:13px;color:var(--ink2);line-height:1.7;font-weight:300}
+
+/* ── Critérios ── */
+.crit-card{background:var(--paper);border:1px solid var(--border);
+  border-radius:12px;overflow:hidden;margin-bottom:20px;
+  animation:up .4s .2s ease both;box-shadow:0 2px 8px var(--shadow)}
+.crit-hdr{padding:14px 22px;border-bottom:1px solid var(--border);
+  font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:var(--ink3);background:linear-gradient(135deg,#f8faff,var(--cream))}
+.crit{display:flex;align-items:flex-start;gap:12px;
+  padding:14px 22px;border-bottom:1px solid var(--border)}
+.crit:last-child{border-bottom:none}
+.c-ic{width:28px;height:28px;border-radius:50%;display:flex;
+  align-items:center;justify-content:center;font-size:13px;
+  flex-shrink:0;margin-top:1px}
+.c-ic.pass{background:#dcfce7}.c-ic.fail{background:#fee2e2}.c-ic.warn{background:#fef9c3}
+.c-body{flex:1}
+.c-nome{font-weight:600;font-size:13px;color:var(--ink);margin-bottom:3px}
+.c-det{font-size:12px;color:var(--ink3);line-height:1.5;font-weight:300}
+.c-badge{font-family:'DM Mono',monospace;font-size:11px;
+  padding:3px 10px;border-radius:20px;flex-shrink:0;
+  margin-top:2px;white-space:nowrap}
+.c-badge.pass{background:#dcfce7;color:var(--green)}
+.c-badge.fail{background:#fee2e2;color:var(--red2)}
+.c-badge.warn{background:#fef9c3;color:#854d0e}
+
+/* ── Footer ── */
+.alerta-politico{background:#1a0a0a;border:1.5px solid var(--red2);border-radius:10px;
+  padding:12px 16px;margin-bottom:16px;display:none;animation:up .3s ease}
+.alerta-politico.on{display:flex;align-items:flex-start;gap:10px}
+.ap-icon{font-size:18px;flex-shrink:0;margin-top:1px}
+.ap-body{flex:1}
+.ap-title{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:2px;
+  color:var(--red2);font-weight:700;margin-bottom:4px}
+.ap-items{font-size:12px;color:#ffaaaa;line-height:1.6}
+
+/* ── Abas ── */
+.tab-btn:hover:not(.active){background:rgba(255,255,255,.12);color:rgba(255,255,255,.7)}
+
+/* ── Comparação ── */
+.ct-rank{font-family:'DM Mono',monospace;font-size:11px;color:var(--ink4);
+  width:30px;text-align:center}
+.ct-ticker{font-family:'DM Mono',monospace;font-size:13px;font-weight:700;
+  color:var(--blue2)}
+.ct-empresa{font-size:11px;color:var(--ink3);margin-top:2px;font-weight:300}
+.ct-score{font-family:'DM Serif Display',serif;font-size:18px;font-weight:700}
+.ct-score.alto{color:var(--green)}
+.ct-score.medio{color:var(--gold)}
+.ct-score.baixo{color:var(--red2)}
+.ct-bar{height:6px;border-radius:6px;margin-top:4px;transition:width .8s ease}
+.ct-sinal{font-size:16px}
+.ct-preco{font-size:12px;color:var(--ink2)}
+.ct-alvo{font-size:11px;color:var(--ink3)}
+.ct-desc{font-size:11px;font-weight:600}
+.ct-desc.pos{color:var(--green)}
+.ct-desc.neg{color:var(--red2)}
+.ct-ctx{font-size:18px}
+.medal-1{color:#FFD700;font-size:16px}
+.medal-2{color:#C0C0C0;font-size:16px}
+.medal-3{color:#CD7F32;font-size:16px}
+
+/* ── Contexto Setorial ── */
+.contexto-setor{border-radius:10px;padding:14px 18px;margin-bottom:16px;
+  animation:up .3s ease;border-left:4px solid}
+.contexto-setor.verde{background:#f0faf4;border-color:var(--green2)}
+.contexto-setor.amarelo{background:#fffbf0;border-color:var(--gold2)}
+.contexto-setor.vermelho{background:#fff5f5;border-color:var(--red2)}
+.cs-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.cs-titulo{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:700}
+.contexto-setor.verde .cs-titulo{color:var(--green)}
+.contexto-setor.amarelo .cs-titulo{color:var(--gold)}
+.contexto-setor.vermelho .cs-titulo{color:var(--red2)}
+.cs-badge{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:1px;
+  padding:3px 10px;border-radius:20px;font-weight:700}
+.contexto-setor.verde .cs-badge{background:#dcfce7;color:var(--green)}
+.contexto-setor.amarelo .cs-badge{background:#fef9c3;color:#854d0e}
+.contexto-setor.vermelho .cs-badge{background:#fee2e2;color:var(--red2)}
+.cs-texto{font-size:12px;line-height:1.7;font-weight:300}
+.contexto-setor.verde .cs-texto{color:#1a4a2e}
+.contexto-setor.amarelo .cs-texto{color:#4a3a00}
+.contexto-setor.vermelho .cs-texto{color:#4a1010}
+
+/* ── Screener ── */
+.scr-card{background:var(--ink);border-radius:12px;padding:28px 24px;
+  margin-bottom:24px;box-shadow:0 12px 40px rgba(10,15,30,.2);position:relative;overflow:hidden}
+.scr-card::before{content:'';position:absolute;top:-50px;right:-50px;
+  width:200px;height:200px;pointer-events:none;
+  background:radial-gradient(circle,rgba(59,130,246,.15),transparent 70%)}
+.scr-label{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:rgba(255,255,255,.4);margin-bottom:12px}
+.scr-textarea{width:100%;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.15);border-radius:8px;
+  padding:14px 18px;font-family:'DM Mono',monospace;font-size:15px;
+  color:#fff;outline:none;letter-spacing:2px;text-transform:uppercase;
+  resize:vertical;min-height:80px;transition:border-color .2s}
+.scr-textarea::placeholder{color:rgba(255,255,255,.2);font-size:12px;letter-spacing:1px;text-transform:none}
+.scr-textarea:focus{border-color:var(--gold2);box-shadow:0 0 0 3px rgba(232,180,32,.15)}
+.scr-row{display:flex;gap:10px;margin-top:12px;align-items:center}
+.btn-screener{background:linear-gradient(135deg,var(--gold),var(--gold2));
+  color:var(--ink);border:none;border-radius:8px;
+  padding:12px 24px;font-family:'DM Serif Display',serif;font-size:16px;
+  cursor:pointer;transition:all .2s;white-space:nowrap;
+  box-shadow:0 4px 16px rgba(200,150,12,.3)}
+.btn-screener:hover{transform:translateY(-1px)}
+.btn-screener:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.scr-progress{font-family:'DM Mono',monospace;font-size:11px;
+  color:rgba(255,255,255,.5);flex:1;letter-spacing:1px}
+
+.ranking-card{background:var(--paper);border:1px solid var(--border);
+  border-radius:12px;overflow:hidden;margin-bottom:20px;
+  animation:up .4s ease;box-shadow:0 4px 20px var(--shadow)}
+.ranking-hdr{padding:14px 22px;border-bottom:1px solid var(--border);
+  background:linear-gradient(135deg,var(--ink),var(--ink2));
+  display:flex;align-items:center;justify-content:space-between}
+.rh-title{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;color:rgba(255,255,255,.6)}
+.rh-count{font-family:'DM Serif Display',serif;font-size:16px;color:var(--gold2)}
+
+.rk-item{display:grid;grid-template-columns:36px 1fr auto;
+  align-items:center;gap:12px;
+  padding:14px 22px;border-bottom:1px solid var(--border);
+  transition:background .15s;cursor:pointer}
+.rk-item:last-child{border-bottom:none}
+.rk-item:hover{background:#f8faff}
+.rk-num{font-family:'DM Serif Display',serif;font-size:22px;
+  color:var(--ink4);text-align:center;line-height:1}
+.rk-num.gold{color:#FFD700}.rk-num.silver{color:#A8A9AD}.rk-num.bronze{color:#CD7F32}
+.rk-body{flex:1;min-width:0}
+.rk-top{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.rk-ticker{font-family:'DM Mono',monospace;font-size:14px;font-weight:700;color:var(--blue2)}
+.rk-empresa{font-size:11px;color:var(--ink4);font-weight:300;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.rk-setor{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:1px;
+  color:var(--ink4);background:var(--cream);padding:2px 8px;border-radius:10px}
+.rk-bottom{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.rk-preco{font-size:12px;color:var(--ink2)}
+.rk-alvo{font-size:11px;color:var(--ink3)}
+.rk-desc{font-size:11px;font-weight:700}
+.rk-desc.pos{color:var(--green)}.rk-desc.neg{color:var(--red2)}
+.rk-ctx{font-size:14px}
+.rk-right{text-align:right;flex-shrink:0}
+.rk-score{font-family:'DM Serif Display',serif;font-size:28px;line-height:1}
+.rk-score.alto{color:var(--green)}.rk-score.medio{color:var(--gold)}.rk-score.baixo{color:var(--red2)}
+.rk-scorelbl{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:1px;
+  color:var(--ink4);margin-top:2px}
+.rk-sinal{font-size:16px;margin-bottom:2px}
+
+.rk-erro{padding:12px 22px;font-size:12px;color:var(--red2);
+  font-family:'DM Mono',monospace;border-bottom:1px solid var(--border)}
+
+/* Tabs */
+.tabs-nav{display:flex;gap:0;border-radius:0;overflow:hidden;
+  background:var(--ink);border-left:none;border-right:none}
+.tab-nav-btn{flex:1;padding:13px 16px;font-family:'DM Mono',monospace;font-size:10px;
+  letter-spacing:2px;border:none;border-bottom:3px solid transparent;
+  cursor:pointer;transition:all .2s;
+  background:transparent;color:rgba(255,255,255,.4)}
+.tab-nav-btn.active{color:#fff;font-weight:700;
+  border-bottom:3px solid var(--gold2);background:rgba(255,255,255,.05)}
+.tab-nav-btn:hover:not(.active){color:rgba(255,255,255,.7);background:rgba(255,255,255,.05)}
+.tab-content{display:none}
+.tabs-wrapper{border:1px solid var(--border);border-radius:0 0 12px 12px;
+  background:var(--paper);padding:24px;margin-bottom:24px}
+
+.disc{font-size:11px;color:var(--ink4);line-height:1.8;text-align:center;
+  padding:18px;border-top:1px solid var(--border);font-weight:300;
+  animation:up .4s .24s ease both}
+
+/* ── Qualitativa ── */
+.qual-card{background:var(--paper);border:1px solid var(--border);border-radius:12px;
+  overflow:hidden;margin-bottom:20px;animation:up .4s .18s ease both;
+  box-shadow:0 2px 8px var(--shadow)}
+.qual-hdr{padding:14px 22px;border-bottom:1px solid var(--border);
+  background:linear-gradient(135deg,#f0f4ff,#eef2ff);
+  display:flex;align-items:center;justify-content:space-between}
+.qual-hdr-left{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;color:var(--ink3)}
+.qual-score-badge{font-family:'DM Serif Display',serif;font-size:18px;
+  background:var(--ink);color:#fff;padding:4px 14px;border-radius:20px}
+.qual-loading{padding:32px;text-align:center;color:var(--ink4);font-size:13px}
+.qual-spinner{width:28px;height:28px;border:2px solid var(--border);
+  border-top-color:var(--blue2);border-radius:50%;
+  animation:spin .8s linear infinite;margin:0 auto 12px}
+.qual-criterios{padding:0}
+.qc{display:flex;align-items:flex-start;gap:14px;
+  padding:14px 22px;border-bottom:1px solid var(--border)}
+.qc:last-child{border-bottom:none}
+.qc-bar-wrap{width:60px;flex-shrink:0;padding-top:4px}
+.qc-bar-bg{height:6px;background:var(--border);border-radius:6px;margin-bottom:3px}
+.qc-bar-fill{height:100%;border-radius:6px;transition:width .8s ease}
+.qc-bar-fill.forte{background:var(--green2)}
+.qc-bar-fill.medio{background:var(--gold2)}
+.qc-bar-fill.fraco{background:var(--red2)}
+.qc-nota{font-family:'DM Mono',monospace;font-size:10px;color:var(--ink4);text-align:center}
+.qc-body{flex:1}
+.qc-nome{font-weight:600;font-size:13px;color:var(--ink);margin-bottom:2px}
+.qc-just{font-size:12px;color:var(--ink3);line-height:1.5;font-weight:300}
+.qc-nivel{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:1px;
+  padding:2px 8px;border-radius:10px;flex-shrink:0;margin-top:2px}
+.qc-nivel.forte{background:#dcfce7;color:var(--green)}
+.qc-nivel.medio{background:#fef9c3;color:#854d0e}
+.qc-nivel.fraco{background:#fee2e2;color:var(--red2)}
+.qual-resumo{padding:16px 22px;background:linear-gradient(135deg,#f8faff,var(--cream));
+  border-top:1px solid var(--border);font-size:13px;color:var(--ink2);
+  line-height:1.7;font-weight:300}
+.score-final-card{background:linear-gradient(135deg,var(--ink),#1a2540);
+  border-radius:12px;padding:22px 26px;margin-bottom:20px;
+  animation:up .4s .22s ease both;box-shadow:0 6px 24px rgba(10,15,30,.2);
+  display:flex;align-items:center;justify-content:space-between;gap:20px}
+.sf-label{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:3px;
+  color:rgba(255,255,255,.4);margin-bottom:8px}
+.sf-score{font-family:'DM Serif Display',serif;font-size:52px;line-height:1}
+.sf-sub{font-size:12px;color:rgba(255,255,255,.4);margin-top:4px;font-family:'DM Mono',monospace}
+.sf-bars{flex:1;max-width:260px}
+.sf-tip{font-size:10px;color:var(--ink4);cursor:help;border:1px solid var(--ink4);
+  border-radius:50%;padding:0 3px;line-height:1;vertical-align:middle;
+  transition:all .2s}
+.sf-tip:hover{color:var(--gold2);border-color:var(--gold2)}
+
+.sf-bar-label{font-size:11px;color:rgba(255,255,255,.5);width:80px;flex-shrink:0;
+  font-family:'DM Mono',monospace;letter-spacing:1px}
+.sf-bar-track{flex:1;height:8px;background:rgba(255,255,255,.1);border-radius:8px}
+.sf-bar-fill{height:100%;border-radius:8px;transition:width .9s ease}
+.sf-bar-val{font-size:11px;color:rgba(255,255,255,.6);width:32px;text-align:right;
+  font-family:'DM Mono',monospace}
+
+@media(max-width:480px){
+  .dados-grid{grid-template-columns:repeat(2,1fr)}
+  .pc-grid{grid-template-columns:repeat(2,1fr)}
+  .pills{gap:8px}.pill{min-width:90px}
+  .brand-row{flex-direction:column;gap:8px}
+}
 </style>
 </head>
 <body>
-<div class="header">
-  <div class="header-left">
-    <div><div class="brand-name">⚛ QUANTTECH</div><div class="brand-sub">TRADING SOLUTIONS</div></div>
-    <div class="divider-v"></div>
-    <div class="header-ticker">{ticker_clean}</div>
-    <div class="header-info">
-      <div class="header-name">{dados.get("nome","") or ""}</div>
-      <div class="header-setor">{dados.get("setor","") or ""}{(" · "+dados.get("subsetor","")) if dados.get("subsetor") else ""}</div>
-    </div>
-  </div>
-  <div class="header-right">
-    <div><div class="header-cotacao">R$ {fmt(dados.get("cotacao"))}</div><div class="header-date">{now}</div></div>
-    <div class="search-bar">
-      <input type="text" id="ticker-input" placeholder="Ex: VALE3" maxlength="10" onkeydown="if(event.key==='Enter') buscarTicker()">
-      <button onclick="buscarTicker()">ANALISAR</button>
-    </div>
-    <div id="search-status"></div>
-    <nav style="display:flex;gap:6px;"><a href="/" style="color:var(--muted);text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;border:1px solid var(--border);font-family:Syne,sans-serif;font-weight:700;letter-spacing:1px;">ANÁLISE</a><a href="/estrategias" style="color:#000;text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;background:var(--cyan);border:1px solid var(--cyan);font-family:Syne,sans-serif;font-weight:700;letter-spacing:1px;">ESTRATÉGIAS</a></nav>
-  </div>
-</div>
-<div class="container">
-  <div class="sidebar">
-    <div class="score-main">
-      <div class="score-number">{score_total}</div><div class="score-sub">/100</div>
-      <div class="score-label">{slabel}</div>
-    </div>
-    <div class="section">
-      <div class="section-title">Score por Categoria</div>
-      <div class="score-cats">
-        <div class="score-cat-row"><div class="score-cat-name">Qualidade</div>
-          <div class="score-bar-track">{barra(scores["qualidade"],40,"#4da6ff")}</div>
-          <div class="score-cat-val">{scores["qualidade"]}/40</div></div>
-        <div class="score-cat-row"><div class="score-cat-name">Valuation</div>
-          <div class="score-bar-track">{barra(scores["valuation"],30,"#00ff88")}</div>
-          <div class="score-cat-val">{scores["valuation"]}/30</div>
-          {"<div class='score-cat-note'>📈 PEG aplicado</div>" if scores.get("empresa_crescimento") else ""}</div>
-        <div class="score-cat-row"><div class="score-cat-name">Crescimento</div>
-          <div class="score-bar-track">{barra(scores["crescimento"],20,"#ffd700")}</div>
-          <div class="score-cat-val">{scores["crescimento"]}/20</div></div>
-        <div class="score-cat-row"><div class="score-cat-name">Solidez</div>
-          <div class="score-bar-track">{barra(scores["solidez"],10,"#00e5ff")}</div>
-          <div class="score-cat-val">{scores["solidez"]}/10</div>
-          {"<div class='score-cat-note'>🏦 Critério Bancário</div>" if eh_banco else ""}</div>
+  <!-- Masthead -->
+  <div class="masthead">
+
+    <div class="brand-row">
+      <div class="brand-text">
+        <div class="brand-quant"><span class="brand-star">⚛️</span> QUANTTECH SYSTEM <span class="brand-trading">[Trading Solutions]</span></div>
+        <div class="brand-title">Valor<em>Justo</em></div>
       </div>
     </div>
-    {oport_html}{band_html}{osc_html}{tec_html}
-  </div>
-  <div class="main">
-    <div class="section"><div class="section-title">📊 Múltiplos</div><div class="ind-grid">
-      {card("P/L",fmt(dados.get("pl"),1),cor(dados.get("pl"),0,10,True) if dados.get("pl") and dados["pl"]>0 else "red")}
-      {card("P/VP",fmt(dados.get("pvp"),2),cor(dados.get("pvp"),0,1.5,True) if dados.get("pvp") else "neutral")}
-      {card("PSR",fmt(dados.get("psr"),2),cor(dados.get("psr"),0,2,True) if dados.get("psr") else "neutral")}
-      {card("P/EBIT",fmt(dados.get("p_ebit"),1),cor(dados.get("p_ebit"),0,10,True) if dados.get("p_ebit") else "neutral")}
-      {card("EV/EBITDA",fmt(dados.get("ev_ebitda"),1),cor(dados.get("ev_ebitda"),0,6,True) if dados.get("ev_ebitda") else "neutral")}
-      {card("EV/EBIT",fmt(dados.get("ev_ebit"),1),cor(dados.get("ev_ebit"),0,12,True) if dados.get("ev_ebit") else "neutral")}
-      {card("LPA",f"R$ {fmt(dados.get('lpa'),2)}","neutral")}
-      {card("VPA",f"R$ {fmt(dados.get('vpa'),2)}","neutral")}
-    </div></div>
-    <div class="section"><div class="section-title">💎 Rentabilidade & Margens</div><div class="ind-grid">
-      {card("ROE",fmt(dados.get("roe"),1,"%"),cor(dados.get("roe"),20,10))}
-      {card("ROIC",fmt(dados.get("roic"),1,"%"),cor(dados.get("roic"),15,10))}
-      {card("EBIT/Ativo",fmt(dados.get("ebit_ativo"),1,"%"),cor(dados.get("ebit_ativo"),8,4))}
-      {card("M. Bruta",fmt(dados.get("margem_bruta"),1,"%"),cor(dados.get("margem_bruta"),30,15))}
-      {card("M. EBIT",fmt(dados.get("margem_ebit"),1,"%"),cor(dados.get("margem_ebit"),15,8))}
-      {card("M. Líquida",fmt(dados.get("margem_liquida"),1,"%"),cor(dados.get("margem_liquida"),10,5))}
-    </div></div>
-    {"<div class='section'><div class='section-title'>🏦 Endividamento & Liquidez</div><div class='ind-grid'>" +
-      card("Dív.Br/Patrim",fmt(dados.get("divida_bruta_patrim"),2),cor(dados.get("divida_bruta_patrim"),0,0.5,True)) +
-      card("Dív.Líq/EBITDA",fmt(dados.get("divida_liquida_ebitda"),1,"x"),cor(dados.get("divida_liquida_ebitda"),0,2,True)) +
-      card("Liquidez Corr.",fmt(dados.get("liquidez_corrente"),2),cor(dados.get("liquidez_corrente"),2,1.5)) +
-      card("Giro Ativos",fmt(dados.get("giro_ativos"),2),cor(dados.get("giro_ativos"),0.8,0.4)) +
-     "</div></div>"
-     if not eh_banco else
-     "<div class='section'><div class='section-title'>🏦 Endividamento & Liquidez</div><div style='color:#4da6ff;font-size:0.7rem;padding:4px 0'>Empresa financeira — métricas de dívida/liquidez não aplicáveis.</div></div>"}
-    <div class="section"><div class="section-title">📈 Crescimento & Dividendos</div><div class="ind-grid">
-      {card("Cresc. 5a",fmt(dados.get("crescimento_receita"),1,"%"),cor(dados.get("crescimento_receita"),20,10))}
-      {card("Div. Yield",fmt(dados.get("div_yield"),1,"%"),cor(dados.get("div_yield"),6,3))}
-      {card("Val. Mercado",fmt_bi(dados.get("valor_mercado")),"neutral")}
-      {card("Val. Firma",fmt_bi(dados.get("valor_firma")),"neutral")}
-      {card("Lucro Líq.",fmt_bi(dados.get("lucro_liquido")),"green" if (dados.get("lucro_liquido") or 0)>0 else "red")}
-    </div></div>
-    {val_html}
-    {sim_html}
-    <div class="class-final">
-      <div class="class-txt">{ctxt}</div>
-      <div class="class-sub">Score {score_total}/100 · {dados.get("setor","") or ""} · {now}</div>
+    <div class="brand-sub">Análise fundamentalista automática de ações brasileiras</div>
+    <div>
+      <span class="live-badge">
+        <span class="live-dot"></span>
+        DADOS REAIS · B3 · IPCA · IBOV
+      </span>
     </div>
   </div>
-</div>
-<div class="footer">⚛️ QUANTTECH · Dados: Fundamentus + Yahoo Finance · Não constitui recomendação de investimento</div>
-<script>
-function buscarTicker() {{
-  const t = document.getElementById('ticker-input').value.trim().toUpperCase();
-  if (!t) {{ alert('Digite um ticker!'); return; }}
-  const st = document.getElementById('search-status');
-  st.textContent = '⏳ ' + t + '...';
-  st.style.color = '#ffd700';
-  window.location.href = '/analisar?ticker=' + t;
-}}
 
-function recalcularSim() {{
-  const valor = document.getElementById('sim-valor').value;
-  const ano   = document.getElementById('sim-ano').value;
-  const st    = document.getElementById('sim-status');
-  if (!valor || !ano) return;
-  st.textContent = '⏳ calculando...';
-  fetch('/simular?ticker={ticker_clean}&valor=' + valor + '&ano=' + ano)
-    .then(r => r.json())
-    .then(d => {{
-      st.textContent = '';
-      if (d.erro) {{ st.textContent = '❌ ' + d.erro; return; }}
-      document.getElementById('sim-content').innerHTML = d.html;
-    }})
-    .catch(() => {{ st.textContent = '❌ erro'; }});
-}}
-</script>
-</body></html>'''
+  <!-- Search -->
+  <div class="search-card">
+    <div class="s-label">TICKER DA AÇÃO</div>
+    <div class="s-row">
+      <input class="ticker-input" id="inp" placeholder="PETR4" maxlength="8" autofocus />
+      <button class="btn-analisar" id="btn" onclick="analisar()">Analisar →</button>
+    </div>
+    <div class="s-hint">Ex: PETR4 · VALE3 · ITUB4 · WEGE3 · BBAS3 · SANB4 · TASA4 · EGIE3</div>
+  </div>
+
+  
 
 
-# ══════════════════════════════════════════════════════════════
-#  FLASK APP — SERVIDOR WEB
-# ══════════════════════════════════════════════════════════════
+  <div class="error" id="err"></div>
 
-app = Flask(__name__)
+  <!-- Loading simples sem mostrar fontes -->
+  <div class="loading" id="load">
+    <div class="spinner"></div>
+    <div class="l-title">Analisando <span id="loadTicker"></span>...</div>
+    <div class="l-sub">Coletando e processando dados fundamentalistas</div>
+  </div>
 
-# Controle de usuários simultâneos
-_lock_usuarios = threading.Lock()
-_usuarios_ativos = 0
-MAX_USUARIOS = 30
-
-PAGINA_INICIO = '''<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚛️ QUANTTECH — Análise de Ações Brasileiras</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
-  *{{box-sizing:border-box;margin:0;padding:0;}}
-  body{{background:#0a0c10;color:#e8eaf0;font-family:'JetBrains Mono',monospace;
-    min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;}}
-  .logo{{font-family:'Syne',sans-serif;font-size:3rem;font-weight:800;color:#00e5ff;
-    letter-spacing:4px;margin-bottom:6px;}}
-  .sub{{font-size:0.7rem;color:#6b7280;letter-spacing:3px;margin-bottom:48px;}}
-  .tagline{{font-size:1rem;color:#e8eaf0;margin-bottom:32px;text-align:center;}}
-  .search-wrap{{display:flex;gap:10px;align-items:center;}}
-  .search-wrap input{{background:#111318;border:1px solid #2a2d36;color:#e8eaf0;
-    border-radius:8px;padding:12px 18px;font-family:'JetBrains Mono',monospace;
-    font-size:1rem;width:220px;text-transform:uppercase;outline:none;
-    transition:border 0.2s;}}
-  .search-wrap input:focus{{border-color:#00e5ff;}}
-  .search-wrap input::placeholder{{color:#6b7280;text-transform:none;}}
-  .search-wrap button{{background:#00e5ff;color:#000;border:none;border-radius:8px;
-    padding:12px 24px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:800;
-    font-size:0.9rem;letter-spacing:1px;transition:opacity 0.2s;}}
-  .search-wrap button:hover{{opacity:0.85;}}
-  .hint{{font-size:0.65rem;color:#6b7280;margin-top:16px;}}
-  .footer{{position:fixed;bottom:16px;font-size:0.6rem;color:#6b7280;}}
-  #loading{{display:none;margin-top:24px;text-align:center;}}
-  .spinner{{width:32px;height:32px;border:3px solid #1a1d24;border-top-color:#00e5ff;
-    border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 12px;}}
-  @keyframes spin{{to{{transform:rotate(360deg);}}}}
-  .loading-txt{{font-size:0.75rem;color:#6b7280;}}
-</style>
-</head>
-<body>
-<div class="logo">⚛ QUANTTECH</div>
-<div class="sub">TRADING SOLUTIONS</div>
-<div class="tagline">Análise fundamentalista de ações brasileiras</div>
-<div class="search-wrap">
-  <input type="text" id="ticker" placeholder="Ex: PETR4, VALE3, ITUB4" maxlength="10"
-         onkeydown="if(event.key==='Enter') analisar()">
-  <button onclick="analisar()">ANALISAR</button>
-</div>
-<div class="hint">Digite o ticker da ação e pressione ANALISAR</div>
-<div id="loading">
-  <div class="spinner"></div>
-  <div class="loading-txt" id="loading-txt">Buscando dados... aguarde ~20 segundos</div>
-</div>
-<div class="footer">Dados: Fundamentus + Yahoo Finance · Não constitui recomendação de investimento</div>
-<script>
-function analisar() {
-  const t = document.getElementById('ticker').value.trim().toUpperCase();
-  if (!t) { alert('Digite um ticker!'); return; }
-  document.getElementById('loading').style.display = 'block';
-  document.getElementById('loading-txt').textContent = 'Analisando ' + t + '... aguarde ~20 segundos';
-  window.location.href = '/analisar?ticker=' + t;
-}
-</script>
-</body></html>'''
-
-PAGINA_SOBRECARGA = '''<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚛️ QUANTTECH — Sistema Sobrecarregado</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&display=swap');
-  *{{box-sizing:border-box;margin:0;padding:0;}}
-  body{{background:#0a0c10;color:#e8eaf0;font-family:'Syne',sans-serif;
-    min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;}}
-  .icon{{font-size:3rem;}}
-  .title{{font-size:1.5rem;font-weight:800;color:#ffd700;}}
-  .msg{{font-size:0.85rem;color:#6b7280;text-align:center;max-width:360px;line-height:1.8;}}
-  a{{color:#00e5ff;text-decoration:none;font-size:0.8rem;}}
-  a:hover{{opacity:0.8;}}
-</style>
-</head>
-<body>
-<div class="icon">⚡</div>
-<div class="title">Sistema Sobrecarregado</div>
-<div class="msg">O sistema está com muitos usuários simultâneos no momento.<br>Por favor, tente novamente em alguns minutos.</div>
-<a href="/">← Voltar ao início</a>
-</body></html>'''
-
-
-@app.route('/')
-def index():
-    return Response(PAGINA_INICIO, mimetype='text/html; charset=utf-8')
-
-
-@app.route('/analisar')
-def analisar_route():
-    global _usuarios_ativos
-    ticker = request.args.get('ticker', '').upper().strip()
-    if not ticker:
-        return Response(PAGINA_INICIO, mimetype='text/html; charset=utf-8')
-
-    with _lock_usuarios:
-        if _usuarios_ativos >= MAX_USUARIOS:
-            return Response(PAGINA_SOBRECARGA, mimetype='text/html; charset=utf-8')
-        _usuarios_ativos += 1
-
-    try:
-        dados = buscar_dados_fundamentus(ticker)
-        if not dados:
-            return Response(f'''<!DOCTYPE html><html><head><meta charset="UTF-8">
-            <style>body{{background:#0a0c10;color:#e8eaf0;font-family:monospace;
-              display:flex;flex-direction:column;align-items:center;justify-content:center;
-              min-height:100vh;gap:16px;}}
-              a{{color:#00e5ff;}}</style></head>
-            <body><h2>❌ Ticker "{ticker}" não encontrado</h2>
-            <p style="color:#6b7280">Verifique se o ticker está correto (ex: PETR4, VALE3, ITUB4)</p>
-            <a href="/">← Voltar</a></body></html>''',
-            mimetype='text/html; charset=utf-8')
-
-        scores  = calcular_score_consolidado(dados)
-        insights = gerar_alertas_inteligentes(dados, ticker)
-
-        ticker_yf = ticker if '.SA' in ticker else f'{ticker}.SA'
-        variacao_3m = None
-        acima_ema50 = None
-        try:
-            acao = yf.Ticker(ticker_yf)
-            hist_semanal = acao.history(period="6mo", interval="1wk")
-            if not hist_semanal.empty:
-                fechamento = hist_semanal["Close"].iloc[-1]
-                ema50 = hist_semanal["Close"].ewm(span=50).mean().iloc[-1]
-                acima_ema50 = fechamento > ema50
-                hist_3m = acao.history(period="3mo")
-                if not hist_3m.empty:
-                    variacao_3m = ((hist_3m["Close"].iloc[-1] - hist_3m["Close"].iloc[0]) / hist_3m["Close"].iloc[0]) * 100
-        except: pass
-
-        preco_justo = preco_teto = None
-        if all([dados.get('lpa'), dados.get('crescimento_receita'), dados.get('vpa'), dados.get('cotacao')]):
-            preco_justo, _ = calcular_preco_justo_graham(dados['lpa'], dados['crescimento_receita'], dados['vpa'], scores['total'])
-            preco_teto, _  = calcular_preco_teto(dados['lpa'], dados['vpa'], scores['qualidade'])
-
-        sim = simulacao_investimento(ticker_yf)
-
-        html = gerar_html_relatorio(ticker, dados, scores, insights, sim,
-                                    preco_justo=preco_justo, preco_teto=preco_teto,
-                                    variacao_3m=variacao_3m, acima_ema50=acima_ema50)
-        return Response(html, mimetype='text/html; charset=utf-8')
-
-    except Exception as e:
-        print(f"[ERRO] /analisar {ticker}: {traceback.format_exc()}")
-        return Response(f'<h2>Erro ao analisar {ticker}: {e}</h2><a href="/">Voltar</a>',
-                        mimetype='text/html; charset=utf-8')
-    finally:
-        with _lock_usuarios:
-            _usuarios_ativos = max(0, _usuarios_ativos - 1)
-
-
-@app.route('/simular')
-def simular_route():
-    ticker = request.args.get('ticker', '').upper().strip()
-    valor  = float(request.args.get('valor', 1000))
-    ano    = int(request.args.get('ano', 2019))
-    ticker_yf = ticker if '.SA' in ticker else f'{ticker}.SA'
-    try:
-        sim = simulacao_investimento(ticker_yf, valor_inicial=valor, ano_inicio=ano)
-        if not sim:
-            return jsonify({'erro': 'Dados insuficientes'}), 400
-        gc = '#00ff88' if sim['ganho_reinvestimento']>0 else '#ff4444'
-        cs = '#00ff88' if sim['retorno_sem']>0 else '#ff4444'
-        chart_bars = ''
-        if sim['historico_dividendos']:
-            max_r = max(d['recebido'] for d in sim['historico_dividendos'])
-            for d in sim['historico_dividendos']:
-                h = (d['recebido']/max_r)*100 if max_r>0 else 0
-                tipo = 'JCP' if d['valor_unit']<0.05 else 'DIV'
-                ct   = '#ffd700' if tipo=='JCP' else '#00ff88'
-                chart_bars += f'<div class="div-bar-wrap"><div class="div-bar-val">R${d["recebido"]:.0f}</div><div class="div-bar-col"><div class="div-bar-fill" style="height:{h:.0f}%;background:{ct}"></div></div><div class="div-bar-date">{d["data"]}</div><div class="div-bar-tipo" style="color:{ct}">{tipo}</div></div>'
-        html = f'''<div class="sim-grid">
-          <div class="sim-card"><div class="sim-label">📦 Sem reinvestimento</div>
-            <div class="sim-value">R$ {sim["valor_sem_reinv_total"]:,.2f}</div>
-            <div class="sim-ret" style="color:{cs}">{sim["retorno_sem"]:+.1f}%</div>
-            <div class="sim-sub">CAGR {sim["cagr_sem"]:.1f}% a.a.</div></div>
-          <div class="sim-card highlight"><div class="sim-label">🔄 Com reinvestimento</div>
-            <div class="sim-value">R$ {sim["valor_com_reinv"]:,.2f}</div>
-            <div class="sim-ret" style="color:#00ff88">{sim["retorno_com"]:+.1f}%</div>
-            <div class="sim-sub">CAGR {sim["cagr_com"]:.1f}% a.a.</div></div>
-          <div class="sim-card"><div class="sim-label">⚡ Ganho do reinvestimento</div>
-            <div class="sim-value" style="color:{gc}">R$ {sim["ganho_reinvestimento"]:,.2f}</div>
-            <div class="sim-ret" style="color:{gc}">{sim["retorno_com"]-sim["retorno_sem"]:+.1f}%</div>
-            <div class="sim-sub">{sim["num_dividendos"]} pagamentos · {sim["acoes_iniciais"]:.1f}→{sim["acoes_com_reinv"]:.1f} ações</div></div>
+  <!-- Dados -->
+  <div class="dados-card" id="dadosCard">
+    <div class="dados-header">
+      <div class="dh-left">
+        <div class="dh-icon">📈</div>
+        <div>
+          <div class="d-ticker" id="dTicker"></div>
+          <div class="d-empresa" id="dEmpresa"></div>
         </div>
-        <div class="sim-meta">Entrada {sim["data_entrada"]} · R$ {sim["preco_entrada"]:.2f} → R$ {sim["preco_atual"]:.2f} hoje</div>
-        <div class="div-chart">{chart_bars}</div>'''
-        return jsonify({'ok': True, 'html': html})
-    except Exception as e:
-        return jsonify({'erro': str(e)}), 500
-
-
-@app.route('/estrategias')
-def estrategias_route():
-    return Response(PAGINA_ESTRATEGIAS, mimetype='text/html; charset=utf-8')
-
-
-@app.route('/scanner', methods=['POST'])
-def scanner_route():
-    """Roda o scanner da estratégia selecionada nas ações enviadas"""
-    try:
-        data = request.get_json()
-        tickers    = [t.strip().upper() for t in data.get('tickers', []) if t.strip()]
-        tp_pct     = float(data.get('tp', 5.0))
-        sl_pct     = float(data.get('sl', 2.0))
-        timeframe  = data.get('timeframe', '1d')
-        estrategia = data.get('estrategia', 'ema91')
-        vol_mult   = float(data.get('vol_mult', 4.0))
-        vol_period = int(data.get('vol_period', 20))
-
-        if not tickers:
-            return jsonify({'erro': 'Nenhum ticker informado'}), 400
-
-        import time
-        resultados = []
-        for ticker in tickers[:15]:  # max 15 ações
-            try:
-                ticker_yf = ticker if '.SA' in ticker else f'{ticker}.SA'
-                periodo = '2y' if timeframe == '1d' else '5y'
-                time.sleep(0.5)  # evita rate limit do Yahoo Finance
-                df = yf.Ticker(ticker_yf).history(period=periodo, interval=timeframe)
-                if df.empty or len(df) < 60:
-                    resultados.append({'ticker': ticker, 'erro': 'Dados insuficientes'})
-                    continue
-
-                close = df['Close']
-                low   = df['Low']
-
-                ema9  = close.ewm(span=9,  adjust=False).mean()
-                ema50 = close.ewm(span=50, adjust=False).mean()
-
-                # ── VOLUME EXPLOSIVO ──────────────────────────────────
-                if estrategia == 'volume':
-                    volume = df['Volume']
-                    vol_ma = volume.rolling(vol_period).mean()
-                    sinal_ativo  = False
-                    sinal_candle = 0
-                    for lookback in [0, 1, 2]:
-                        idx = -(1 + lookback)
-                        if vol_ma.iloc[idx] and vol_ma.iloc[idx] > 0:
-                            if volume.iloc[idx] > (vol_ma.iloc[idx] * vol_mult):
-                                sinal_ativo  = True
-                                sinal_candle = lookback
-                                break
-
-                # ── EMA 9.1 ───────────────────────────────────────────────
-                else:
-                    # Sinal atual — verifica candle atual e 2 anteriores (como TradingView)
-                    sinal_ativo = False
-                    sinal_candle = 0
-                    if len(ema9) >= 5:
-                        for lookback in [0, 1, 2]:
-                            idx = -(1 + lookback)
-                            e9_now   = ema9.iloc[idx]
-                            e9_prev  = ema9.iloc[idx - 1]
-                            e9_prev2 = ema9.iloc[idx - 2]
-                            e50_now  = ema50.iloc[idx]
-                            e50_prev = ema50.iloc[idx - 1]
-                            virou  = (e9_now > e9_prev) and (e9_prev < e9_prev2) and (e9_now > e50_now)
-                            inclin = e50_now > e50_prev
-                            if virou and inclin:
-                                sinal_ativo  = True
-                                sinal_candle = lookback
-                                break
-
-                # Backtesting da estratégia
-                trades = []
-                em_posicao = False
-                preco_entrada = 0.0
-                stop_nivel = 0.0
-                candle_entrada = 0
-
-                for i in range(3, len(df)):
-                    c     = close.iloc[i]
-                    e9    = ema9.iloc[i];  e9_1 = ema9.iloc[i-1];  e9_2 = ema9.iloc[i-2]
-                    e50   = ema50.iloc[i]; e50_1 = ema50.iloc[i-1]
-                    lo    = low.iloc[i]
-
-                    if not em_posicao:
-                        cond = (e9 > e9_1) and (e9_1 < e9_2) and (e9 > e50) and (e50 > e50_1)
-                        if cond:
-                            preco_entrada  = c
-                            stop_nivel     = lo * (1 - sl_pct / 100)
-                            tp_nivel       = c * (1 + tp_pct / 100)
-                            em_posicao     = True
-                            candle_entrada = i
-                    else:
-                        # Atualiza stop dinâmico
-                        if c < e50 and i > candle_entrada:
-                            stop_nivel = min(stop_nivel, lo * (1 - sl_pct / 100))
-                        # Saída por TP
-                        if c >= tp_nivel:
-                            trades.append({'resultado': 'win', 'retorno': (tp_nivel - preco_entrada) / preco_entrada * 100})
-                            em_posicao = False
-                        # Saída por SL
-                        elif lo <= stop_nivel:
-                            trades.append({'resultado': 'loss', 'retorno': (stop_nivel - preco_entrada) / preco_entrada * 100})
-                            em_posicao = False
-
-                # Métricas
-                total     = len(trades)
-                wins      = sum(1 for t in trades if t['resultado'] == 'win')
-                losses    = total - wins
-                win_rate  = (wins / total * 100) if total > 0 else 0
-                gross_profit = sum(t['retorno'] for t in trades if t['resultado'] == 'win')
-                gross_loss   = abs(sum(t['retorno'] for t in trades if t['resultado'] == 'loss'))
-                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0)
-                lp_total  = sum(t['retorno'] for t in trades)
-
-                # Drawdown máximo simples
-                capital = 100.0
-                peak = 100.0
-                max_dd = 0.0
-                for t in trades:
-                    capital *= (1 + t['retorno'] / 100)
-                    if capital > peak: peak = capital
-                    dd = (peak - capital) / peak * 100
-                    if dd > max_dd: max_dd = dd
-
-                resultados.append({
-                    'ticker':         ticker,
-                    'sinal':          sinal_ativo,
-                    'sinal_candle':   sinal_candle if sinal_ativo else -1,
-                    'estrategia':     estrategia,
-                    'volume_atual':   int(df['Volume'].iloc[-1]) if estrategia == 'volume' else None,
-                    'volume_media':   int(df['Volume'].rolling(vol_period).mean().iloc[-1]) if estrategia == 'volume' else None,
-                    'volume_mult_real': round(df['Volume'].iloc[-1] / df['Volume'].rolling(vol_period).mean().iloc[-1], 1) if estrategia == 'volume' and df['Volume'].rolling(vol_period).mean().iloc[-1] > 0 else None,
-                    'cotacao':        round(float(close.iloc[-1]), 2),
-                    'ema9':           round(float(ema9.iloc[-1]), 2),
-                    'ema50':          round(float(ema50.iloc[-1]), 2),
-                    'total_trades':   total,
-                    'win_rate':       round(win_rate, 1),
-                    'wins':           wins,
-                    'losses':         losses,
-                    'profit_factor':  round(profit_factor, 3),
-                    'lp_total':       round(lp_total, 2),
-                    'max_dd':         round(max_dd, 1),
-                    'aprovada':       profit_factor > 1.5 and max_dd < 30 and win_rate > 30 and total >= 18,
-                })
-            except Exception as e:
-                resultados.append({'ticker': ticker, 'erro': str(e)})
-
-        return jsonify({'ok': True, 'resultados': resultados})
-    except Exception as e:
-        return jsonify({'erro': str(e)}), 500
-
-
-PAGINA_ESTRATEGIAS = '''<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚛️ QUANTTECH — Estratégias</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
-  :root{--bg:#0a0c10;--bg2:#111318;--bg3:#1a1d24;--border:#2a2d36;
-    --green:#00ff88;--red:#ff4455;--yellow:#ffd700;--cyan:#00e5ff;--text:#e8eaf0;--muted:#6b7280;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;min-height:100vh;}
-  /* HEADER */
-  .header{background:linear-gradient(135deg,#0d1117,#111827);border-bottom:1px solid var(--border);
-    padding:8px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-    position:sticky;top:0;z-index:100;}
-  .brand{display:flex;align-items:center;gap:10px;}
-  .brand-name{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--cyan);letter-spacing:3px;}
-  .brand-sub{font-size:0.5rem;color:var(--muted);letter-spacing:2px;}
-  .nav{display:flex;gap:6px;}
-  .nav a{color:var(--muted);text-decoration:none;font-size:0.65rem;padding:5px 12px;border-radius:5px;
-    border:1px solid var(--border);transition:all 0.2s;font-family:'Syne',sans-serif;font-weight:700;letter-spacing:1px;}
-  .nav a:hover{color:var(--cyan);border-color:var(--cyan);}
-  .nav a.active{color:#000;background:var(--cyan);border-color:var(--cyan);}
-  /* MAIN */
-  .container{max-width:1200px;margin:0 auto;padding:20px;}
-  .page-title{font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:800;color:var(--cyan);
-    letter-spacing:3px;margin-bottom:4px;}
-  .page-sub{font-size:0.6rem;color:var(--muted);letter-spacing:2px;margin-bottom:24px;}
-  /* STRATEGY CARD */
-  .strat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:24px;}
-  .strat-card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;
-    cursor:pointer;transition:all 0.2s;position:relative;overflow:hidden;}
-  .strat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cyan),var(--green));}
-  .strat-card:hover{border-color:var(--cyan);transform:translateY(-2px);}
-  .strat-card.selected{border-color:var(--cyan);background:#0d1a1f;}
-  .strat-name{font-family:'Syne',sans-serif;font-size:0.9rem;font-weight:800;color:var(--cyan);margin-bottom:4px;}
-  .strat-desc{font-size:0.62rem;color:var(--muted);line-height:1.6;margin-bottom:10px;}
-  .strat-tags{display:flex;gap:5px;flex-wrap:wrap;}
-  .strat-tag{background:var(--bg3);border:1px solid var(--border);border-radius:3px;
-    padding:2px 7px;font-size:0.55rem;color:var(--cyan);}
-  /* CONFIG PANEL */
-  .config-panel{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
-    padding:16px;margin-bottom:20px;display:none;}
-  .config-panel.visible{display:block;}
-  .config-title{font-family:'Syne',sans-serif;font-size:0.7rem;font-weight:700;
-    color:var(--muted);letter-spacing:2px;margin-bottom:14px;text-transform:uppercase;}
-  .config-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:16px;}
-  .config-field{display:flex;flex-direction:column;gap:4px;}
-  .config-label{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}
-  .config-input{background:var(--bg3);border:1px solid var(--border);color:var(--text);
-    border-radius:5px;padding:7px 10px;font-family:'JetBrains Mono',monospace;font-size:0.75rem;outline:none;
-    transition:border 0.2s;}
-  .config-input:focus{border-color:var(--cyan);}
-  select.config-input option{background:var(--bg3);}
-  /* TICKERS */
-  .tickers-section{margin-bottom:16px;}
-  .tickers-label{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}
-  .tickers-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;min-height:36px;
-    background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:6px;}
-  .ticker-chip{background:#1a2a1a;border:1px solid var(--green);border-radius:4px;
-    padding:3px 8px;font-size:0.65rem;color:var(--green);display:flex;align-items:center;gap:5px;cursor:default;}
-  .ticker-chip span{cursor:pointer;color:var(--muted);font-size:0.7rem;} .ticker-chip span:hover{color:var(--red);}
-  .ticker-add{display:flex;gap:6px;}
-  .ticker-add input{background:var(--bg3);border:1px solid var(--border);color:var(--text);
-    border-radius:5px;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:0.75rem;
-    outline:none;width:110px;text-transform:uppercase;}
-  .ticker-add input:focus{border-color:var(--cyan);}
-  .ticker-add button{background:var(--bg3);color:var(--cyan);border:1px solid var(--cyan);
-    border-radius:5px;padding:6px 12px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.65rem;}
-  .ticker-add button:hover{background:var(--cyan);color:#000;}
-  /* BTN SCANNER */
-  .btn-scanner{background:linear-gradient(135deg,var(--cyan),#0099aa);color:#000;border:none;
-    border-radius:7px;padding:12px 32px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:800;
-    font-size:0.85rem;letter-spacing:2px;transition:all 0.2s;width:100%;}
-  .btn-scanner:hover{opacity:0.9;transform:translateY(-1px);}
-  .btn-scanner:disabled{opacity:0.5;cursor:not-allowed;transform:none;}
-  /* PROGRESS */
-  .progress-wrap{display:none;margin-top:12px;text-align:center;}
-  .progress-wrap.visible{display:block;}
-  .progress-bar{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin:8px 0;}
-  .progress-fill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));
-    border-radius:2px;width:0%;transition:width 0.3s;}
-  .progress-txt{font-size:0.65rem;color:var(--cyan);}
-  /* RESULTS */
-  .results-section{display:none;margin-top:24px;}
-  .results-section.visible{display:block;}
-  .results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;}
-  .results-title{font-family:'Syne',sans-serif;font-size:0.85rem;font-weight:800;color:var(--text);letter-spacing:2px;}
-  .results-summary{display:flex;gap:10px;flex-wrap:wrap;}
-  .sum-badge{padding:4px 10px;border-radius:4px;font-size:0.62rem;font-weight:700;font-family:'Syne',sans-serif;}
-  .sum-badge.sinal{background:rgba(0,255,136,0.15);color:var(--green);border:1px solid rgba(0,255,136,0.3);}
-  .sum-badge.sem-sinal{background:rgba(255,68,85,0.1);color:var(--red);border:1px solid rgba(255,68,85,0.2);}
-  /* RESULT CARDS */
-  .result-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;}
-  .result-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px;
-    position:relative;overflow:hidden;transition:border 0.2s;}
-  .result-card.com-sinal{border-color:rgba(0,255,136,0.4);background:linear-gradient(135deg,#0d1a12,var(--bg2));}
-  .result-card.sem-sinal{opacity:0.7;}
-  .result-card.com-sinal::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--green);}
-  .rc-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
-  .rc-ticker{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;}
-  .rc-ticker.sinal{color:var(--green);} .rc-ticker.no-sinal{color:var(--muted);}
-  .rc-badge{padding:3px 10px;border-radius:4px;font-size:0.6rem;font-weight:700;font-family:'Syne',sans-serif;letter-spacing:1px;}
-  .rc-badge.sinal{background:rgba(0,255,136,0.2);color:var(--green);border:1px solid rgba(0,255,136,0.4);}
-  .rc-badge.no-sinal{background:rgba(107,114,128,0.2);color:var(--muted);border:1px solid var(--border);}
-  .rc-cotacao{font-size:0.7rem;color:var(--muted);margin-bottom:10px;}
-  .rc-cotacao strong{color:var(--text);font-size:0.85rem;}
-  .rc-emas{display:flex;gap:8px;margin-bottom:10px;}
-  .rc-ema{background:var(--bg3);border-radius:4px;padding:3px 8px;font-size:0.58rem;}
-  .rc-ema.e9{color:#ff9900;border:1px solid rgba(255,153,0,0.3);}
-  .rc-ema.e50{color:var(--cyan);border:1px solid rgba(0,229,255,0.3);}
-  .rc-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;}
-  .rc-metric{background:var(--bg3);border-radius:5px;padding:6px 8px;text-align:center;}
-  .rc-metric-label{font-size:0.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}
-  .rc-metric-value{font-size:0.82rem;font-weight:700;margin-top:2px;}
-  .rc-aprovada{margin-top:8px;padding:5px;border-radius:4px;text-align:center;
-    font-family:'Syne',sans-serif;font-size:0.6rem;font-weight:700;letter-spacing:1px;}
-  .rc-aprovada.ok{background:rgba(0,255,136,0.1);color:var(--green);border:1px solid rgba(0,255,136,0.2);}
-  .rc-aprovada.nok{background:rgba(255,68,85,0.1);color:var(--red);border:1px solid rgba(255,68,85,0.2);}
-  .rc-erro{font-size:0.65rem;color:var(--muted);padding:8px 0;}
-  /* NENHUM SINAL */
-  .no-signal-box{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
-    padding:32px;text-align:center;grid-column:1/-1;}
-  .no-signal-icon{font-size:2.5rem;margin-bottom:12px;}
-  .no-signal-title{font-family:'Syne',sans-serif;font-size:1rem;font-weight:800;color:var(--muted);margin-bottom:6px;}
-  .no-signal-sub{font-size:0.65rem;color:var(--muted);}
-  @media(max-width:700px){.config-grid{grid-template-columns:1fr 1fr;}.result-cards{grid-template-columns:1fr;}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="brand">
-    <div><div class="brand-name">⚛ QUANTTECH</div><div class="brand-sub">TRADING SOLUTIONS</div></div>
-  </div>
-  <div class="nav">
-    <a href="/">ANÁLISE</a>
-    <a href="/estrategias" class="active">ESTRATÉGIAS</a>
-  </div>
-</div>
-
-<div class="container">
-  <div class="page-title">⚡ ESTRATÉGIAS</div>
-  <div class="page-sub">SELECIONE UMA ESTRATÉGIA · CONFIGURE · ESCANEIE O MERCADO</div>
-
-  <!-- STRATEGY CARDS -->
-  <div class="strat-cards">
-    <div class="strat-card selected" onclick="selecionarEstrategia('ema91')" id="card-ema91">
-      <div class="strat-name">EMA 9.1</div>
-      <div class="strat-desc">Sinal de compra quando a EMA 9 vira para cima, está acima da EMA 50 e a EMA 50 está inclinada para cima. Stop e Take Profit ajustáveis.</div>
-      <div class="strat-tags">
-        <span class="strat-tag">TENDÊNCIA</span>
-        <span class="strat-tag">EMA 9</span>
-        <span class="strat-tag">EMA 50</span>
-        <span class="strat-tag">SWING</span>
       </div>
+      <div class="fonte-tag">DADOS REAIS</div>
     </div>
-    <div class="strat-card" onclick="selecionarEstrategia('volume')" id="card-volume">
-      <div class="strat-name" style="color:#ffd700">📊 VOLUME EXPLOSIVO</div>
-      <div class="strat-desc">Sinal quando o volume do candle atual é mais de 4x a média de volume dos últimos 20 períodos. Identifica movimentos com força institucional.</div>
-      <div class="strat-tags">
-        <span class="strat-tag" style="color:#ffd700">VOLUME</span>
-        <span class="strat-tag" style="color:#ffd700">INSTITUCIONAL</span>
-        <span class="strat-tag" style="color:#ffd700">BREAKOUT</span>
-      </div>
-    </div>
-    <div class="strat-card" onclick="selecionarEstrategia('em-breve')" style="opacity:0.4;cursor:not-allowed;">
-      <div class="strat-name" style="color:var(--muted)">+ ESTRATÉGIA</div>
-      <div class="strat-desc">Em breve. Novas estratégias serão adicionadas aqui.</div>
-      <div class="strat-tags"><span class="strat-tag" style="color:var(--muted)">EM BREVE</span></div>
-    </div>
+    <div class="dados-grid" id="dGrid"></div>
   </div>
 
-  <!-- CONFIG PANEL -->
-  <div class="config-panel visible" id="config-panel">
-    <div class="config-title" id="config-title">⚙ Configuração — EMA 9.1</div>
-    <div class="config-grid" id="cfg-ema91-params">
-      <div class="config-field">
-        <div class="config-label">Take Profit (%)</div>
-        <input type="number" class="config-input" id="cfg-tp" value="5.0" min="0.5" max="50" step="0.5">
-      </div>
-      <div class="config-field">
-        <div class="config-label">Stop Loss (%)</div>
-        <input type="number" class="config-input" id="cfg-sl" value="2.0" min="0.5" max="20" step="0.5">
-      </div>
-      <div class="config-field">
-        <div class="config-label">Timeframe</div>
-        <select class="config-input" id="cfg-tf">
-          <option value="1d" selected>Diário (1D)</option>
-          <option value="1wk">Semanal (1W)</option>
-        </select>
-      </div>
+  <!-- Resultado -->
+  <div id="result">
+    <div class="verdict" id="verdict">
+      <div class="v-eye" id="vEye"></div>
+      <div class="v-title" id="vTitle"></div>
+      <div class="v-text" id="vText"></div>
+      <div class="v-score" id="vScore"></div>
     </div>
-    <div class="config-grid" id="cfg-volume-params" style="display:none">
-      <div class="config-field">
-        <div class="config-label">Multiplicador de Volume</div>
-        <input type="number" class="config-input" id="cfg-vol-mult" value="4" min="1" max="20" step="0.5">
+
+    <div class="pills" id="pills"></div>
+
+    <div class="gauge-card">
+      <div class="g-lbl">TERMÔMETRO DE ATRATIVIDADE</div>
+      <div class="g-track">
+        <div class="g-fill" id="gFill" style="width:0%"></div>
+        <div class="g-pin" id="gPin" style="left:0%"></div>
       </div>
-      <div class="config-field">
-        <div class="config-label">Média de Volume (períodos)</div>
-        <input type="number" class="config-input" id="cfg-vol-period" value="20" min="5" max="100" step="1">
-      </div>
-      <div class="config-field">
-        <div class="config-label">Timeframe</div>
-        <select class="config-input" id="cfg-vol-tf">
-          <option value="1d" selected>Diário (1D)</option>
-          <option value="1wk">Semanal (1W)</option>
-        </select>
+      <div class="g-labs"><span>EVITAR</span><span>NEUTRO</span><span>ATRATIVO</span></div>
+    </div>
+
+    <!-- Contexto Setorial -->
+    <div id="contextoSetorCard" style="display:none"></div>
+
+    <!-- Alerta Político -->
+    <div class="alerta-politico" id="alertaPolitico">
+      <div class="ap-icon">⚠️</div>
+      <div class="ap-body">
+        <div class="ap-title">ALERTAS</div>
+        <div class="ap-items" id="alertaPoliticoItems"></div>
       </div>
     </div>
 
-    <div class="tickers-section">
-      <div class="tickers-label">Ações para escanear (máx. 15)</div>
-      <div class="tickers-wrap" id="tickers-wrap"></div>
-      <div class="ticker-add">
-        <input type="text" id="ticker-novo" placeholder="Ex: VALE3" maxlength="8"
-               onkeydown="if(event.key==='Enter') adicionarTicker()">
-        <button onclick="adicionarTicker()">+ ADICIONAR</button>
+    <!-- Score Final — logo abaixo do termômetro -->
+    <div class="score-final-card" id="scoreFinalCard" style="display:none">
+      <div>
+        <div class="sf-label">SCORE FINAL</div>
+        <div class="sf-score" id="sfScore" style="color:var(--gold2)">—</div>
+        <div class="sf-sub">QUANT + QUALITATIVO</div>
+      </div>
+      <div class="sf-bars">
+        <div class="sf-bar-row">
+          <div class="sf-bar-label">QUANTITATIVO <span class="sf-tip" title="Baseado em dados numéricos: P/L, P/VP, ROE, DY, Liquidez, Endividamento. Representa 60% do Score Final.">ⓘ</span></div>
+          <div class="sf-bar-track"><div class="sf-bar-fill" id="sfBarQuant" style="width:0%;background:var(--blue2)"></div></div>
+          <div class="sf-bar-val" id="sfValQuant">—</div>
+        </div>
+        <div class="sf-bar-row">
+          <div class="sf-bar-label">QUALITATIVO <span class="sf-tip" title="Análise de negócio: Moat, Previsibilidade de Receita, Gestão, Posição no Setor, Risco Regulatório. Representa 40% do Score Final.">ⓘ</span></div>
+          <div class="sf-bar-track"><div class="sf-bar-fill" id="sfBarQual" style="width:0%;background:var(--gold2)"></div></div>
+          <div class="sf-bar-val" id="sfValQual">—</div>
+        </div>
       </div>
     </div>
 
-    <button class="btn-scanner" id="btn-scanner" onclick="rodarScanner()">
-      ⚡ ESCANEAR MERCADO
-    </button>
+    <div class="preco-card" id="precoCard"></div>
 
-    <div class="progress-wrap" id="progress-wrap">
-      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-      <div class="progress-txt" id="progress-txt">Iniciando scanner...</div>
+    <div class="analise-card" id="analiseCard">
+      <div class="analise-hdr">ANÁLISE FUNDAMENTALISTA</div>
+      <div class="analise-body" id="analiseBody"></div>
+    </div>
+
+    <div class="crit-card">
+      <div class="crit-hdr">CRITÉRIOS ANALISADOS</div>
+      <div id="critList"></div>
+    </div>
+
+    <!-- Análise Qualitativa -->
+    <div class="qual-card" id="qualCard">
+      <div class="qual-hdr">
+        <div class="qual-hdr-left">ANÁLISE QUALITATIVA · IA</div>
+        <div class="qual-score-badge" id="qualScoreBadge" style="display:none">—</div>
+      </div>
+      <div id="qualBody">
+        <div class="qual-loading">
+          <div class="qual-spinner"></div>
+          Consultando inteligência artificial...
+        </div>
+      </div>
+    </div>
+
+
+
+
+
+    <div class="disc">
+      ⚠️ Ferramenta educacional — não constitui recomendação de investimento.<br>
+      Dados coletados automaticamente de fontes públicas. Verifique sempre antes de investir.<br>
+      <strong>QuantTech Valor Justo</strong> · Análise fundamentalista para o investidor brasileiro
+    </div>
+
+  <!-- ── SCREENER ── sempre visível -->
+  <div class="scr-card" style="margin-top:32px">
+    <div class="scr-label">📊 SCREENER · RANKING — ANÁLISE EM LOTE</div>
+    <div style="font-size:12px;color:rgba(255,255,255,.5);margin-bottom:14px">
+      Digite vários tickers e receba um ranking ordenado por Score Final
+    </div>
+    <textarea class="scr-textarea" id="scrInput"
+      placeholder="Ex: PETR4, VALE3, ITUB4, WEGE3, BBAS3, SAPR4, KEPL3, EGIE3"></textarea>
+    <div class="scr-row">
+      <button class="btn-screener" onclick="rodarScreener()" id="btnScr">
+        📊 Gerar Ranking →
+      </button>
+      <div class="scr-progress" id="scrProg"></div>
     </div>
   </div>
+  <div id="scrResultado"></div>
 
-  <!-- RESULTS -->
-  <div class="results-section" id="results-section">
-    <div class="results-header">
-      <div class="results-title">📊 RESULTADO DO SCANNER</div>
-      <div class="results-summary" id="results-summary"></div>
-    </div>
-    <div class="result-cards" id="result-cards"></div>
   </div>
-</div>
+
 
 <script>
-const TICKERS_DEFAULT = ['RANI3','VALE3','PETR4','ITUB4','BBAS3','WEGE3','RENT3','PRIO3','SAPR4','EGIE3'];
-let tickers = [...TICKERS_DEFAULT];
+const $=id=>document.getElementById(id);
+const fmt=(n,d=2)=>isNaN(n)||n===null?'—':Number(n).toLocaleString('pt-BR',{minimumFractionDigits:d,maximumFractionDigits:d});
 
-function renderTickers() {
-  const wrap = document.getElementById('tickers-wrap');
-  wrap.innerHTML = tickers.map(t =>
-    `<div class="ticker-chip">${t} <span onclick="removerTicker('${t}')">✕</span></div>`
-  ).join('');
+async function analisar(){
+  const ticker=$('inp').value.trim().toUpperCase();
+  if(!ticker){showErr('Digite o ticker. Ex: PETR4');return;}
+  hideErr();
+  $('dadosCard').classList.remove('on');
+  $('result').style.display='none';
+  $('loadTicker').textContent=ticker;
+  $('load').classList.add('on');
+  $('btn').disabled=true;
+  try{
+    const res=await fetch('/analisar?ticker='+encodeURIComponent(ticker));
+    const d=await res.json();
+    $('load').classList.remove('on');
+    if(d.erro){showErr(d.erro);return;}
+    render(d);
+  }catch(e){
+    $('load').classList.remove('on');
+    showErr('Não foi possível conectar. Certifique-se que quanttech.py está rodando.');
+  }
+  $('btn').disabled=false;
 }
 
-function adicionarTicker() {
-  const inp = document.getElementById('ticker-novo');
-  const t = inp.value.trim().toUpperCase();
-  if (!t) return;
-  if (tickers.includes(t)) { inp.value=''; return; }
-  if (tickers.length >= 15) { alert('Máximo de 15 ações!'); return; }
-  tickers.push(t);
-  renderTickers();
-  inp.value = '';
-}
+function showErr(m){const e=$('err');e.textContent=m;e.classList.add('on');}
+function hideErr(){$('err').classList.remove('on');}
 
-function removerTicker(t) {
-  tickers = tickers.filter(x => x !== t);
-  renderTickers();
-}
+function render(d){
+  const dd=d.dados;
 
-let estrategiaAtual = 'ema91';
-function selecionarEstrategia(id) {
-  if (id === 'em-breve') return;
-  estrategiaAtual = id;
-  document.querySelectorAll('.strat-card').forEach(c => c.classList.remove('selected'));
-  document.getElementById('card-' + id).classList.add('selected');
-  document.getElementById('config-panel').classList.add('visible');
-  // Mostrar/ocultar params
-  document.getElementById('cfg-ema91-params').style.display  = id === 'ema91'   ? 'grid' : 'none';
-  document.getElementById('cfg-volume-params').style.display = id === 'volume'  ? 'grid' : 'none';
-  const titles = {ema91: '⚙ Configuração — EMA 9.1', volume: '⚙ Configuração — Volume Explosivo'};
-  document.getElementById('config-title').textContent = titles[id] || '⚙ Configuração';
-}
+  // Dados card
+  $('dTicker').textContent=d.ticker;
+  $('dEmpresa').textContent=d.empresa+(d.setor&&d.setor!=='—'?' · '+d.setor:'');
+  $('dGrid').innerHTML=[
+    {l:'PREÇO',       v:'R$ '+fmt(dd.preco),                                    c:''},
+    {l:'P/L',         v:fmt(dd.pl,1)+'x',     c:dd.pl>0&&dd.pl<15?'pos':dd.pl>25?'neg':''},
+    {l:'P/VP',        v:fmt(dd.pvp,2)+'x',    c:dd.pvp<1.5?'pos':dd.pvp>2.5?'neg':''},
+    {l:'ROE',         v:fmt(dd.roe,1)+'%',    c:dd.roe>=15?'pos':dd.roe<8?'neg':''},
+    {l:'DY',          v:fmt(dd.dy,1)+'%',     c:dd.dy>=4?'pos':dd.dy<2?'neg':''},
+    {l:'LPA',         v:'R$ '+fmt(dd.lpa),                                      c:''},
+    {l:'VPA',         v:'R$ '+fmt(dd.vpa),                                      c:''},
+    {l:'VAR. MÊS',    v:(dd.var_mes>=0?'+':'')+fmt(dd.var_mes,1)+'%',           c:dd.var_mes>=0?'pos':'neg'},
+    {l:'IPCA 12M',    v:fmt(dd.ipca_12m,2)+'%',                                 c:'gld'},
+    {l:'DÓLAR',        v:dd.dolar>0?'R$ '+fmt(dd.dolar,2):'—',                  c:dd.dolar>5.5?'neg':dd.dolar>5.0?'gld':'pos'},
+  ].map(c=>`<div class="dado"><div class="d-lbl">${c.l}</div><div class="d-val ${c.c}">${c.v}</div></div>`).join('');
+  $('dadosCard').classList.add('on');
 
-function rodarScanner() {
-  if (tickers.length === 0) { alert('Adicione pelo menos uma ação!'); return; }
+  // Verdict
+  const sc=d.score, pj=d.precos_justos, mg=pj.margem||0;
+  const verd=sc>=65?'ATRATIVO':sc>=40?'NEUTRO':'CARO';
+  const cls=verd==='ATRATIVO'?'buy':verd==='NEUTRO'?'hold':'avoid';
+  $('verdict').className='verdict '+cls;
+  $('vEye').textContent=verd==='ATRATIVO'?'✦ SINAL POSITIVO':verd==='NEUTRO'?'◈ SINAL NEUTRO':'⚠ SINAL DE CAUTELA';
+  $('vTitle').textContent=verd==='ATRATIVO'?d.ticker+' parece atrativo':verd==='NEUTRO'?d.ticker+' exige atenção':d.ticker+' não parece barato agora';
+  $('vText').textContent=verd==='ATRATIVO'
+    ?'Os indicadores fundamentalistas apontam para um preço com desconto em relação ao valor intrínseco calculado. A combinação de múltiplos, rentabilidade e margem de segurança sugere atratividade para o investidor de longo prazo.'
+    :verd==='NEUTRO'
+    ?'A ação apresenta pontos positivos e negativos equilibrados. O preço está próximo do valor justo estimado, sem grande desconto nem prêmio excessivo. Vale monitorar e aguardar melhor ponto de entrada.'
+    :'Os critérios indicam que o preço atual está elevado em relação aos fundamentos ou que a empresa apresenta fragilidades operacionais. Não significa má empresa — apenas que o momento pode não ser o ideal para entrada.';
+  $('vScore').textContent=sc+'%';
 
-  const btn = document.getElementById('btn-scanner');
-  const prog = document.getElementById('progress-wrap');
-  const fill = document.getElementById('progress-fill');
-  const txt  = document.getElementById('progress-txt');
-  const res  = document.getElementById('results-section');
+  // Pills
+  $('pills').innerHTML=[
+    {l:'PONTUAÇÃO', v:sc+'%',            s:'de 100%',       c:sc>=65?'pos':sc>=40?'gld':'neg'},
+    {l:'P/L',       v:fmt(dd.pl,1)+'x', s:'Preço/Lucro',   c:dd.pl>0&&dd.pl<15?'pos':dd.pl>25?'neg':''},
+    {l:'P/VP',      v:fmt(dd.pvp,2)+'x',s:'Preço/Patrim.', c:dd.pvp<1.5?'pos':dd.pvp>2.5?'neg':''},
+    {l:'DY',        v:fmt(dd.dy,1)+'%', s:'Dividend Yield', c:dd.dy>=4?'pos':dd.dy<2?'neg':''},
+  ].map(p=>`<div class="pill"><div class="p-lbl">${p.l}</div><div class="p-val ${p.c}">${p.v}</div><div class="p-sub">${p.s}</div></div>`).join('');
 
-  btn.disabled = true;
-  btn.textContent = '⏳ ESCANEANDO...';
-  prog.classList.add('visible');
-  res.classList.remove('visible');
+  // Gauge
+  setTimeout(()=>{$('gFill').style.width=sc+'%';$('gPin').style.left=sc+'%';},120);
 
-  // Animação de progresso
-  let pct = 0;
-  const interval = setInterval(() => {
-    pct = Math.min(pct + (100 / (tickers.length * 4)), 90);
-    fill.style.width = pct + '%';
-    txt.textContent = `Analisando ${tickers.length} ações... ${Math.round(pct)}%`;
-  }, 400);
-
-  const payload = {
-    tickers: tickers,
-    estrategia: estrategiaAtual,
-    tp: parseFloat(document.getElementById('cfg-tp').value || 5),
-    sl: parseFloat(document.getElementById('cfg-sl').value || 2),
-    timeframe: estrategiaAtual === 'volume'
-      ? document.getElementById('cfg-vol-tf').value
-      : document.getElementById('cfg-tf').value,
-    vol_mult:   parseFloat(document.getElementById('cfg-vol-mult') ? document.getElementById('cfg-vol-mult').value : 4),
-    vol_period: parseInt(document.getElementById('cfg-vol-period') ? document.getElementById('cfg-vol-period').value : 20),
+  // ── Alerta Político ──
+  const alertas = [];
+  const setorLower = (d.setor||'').toLowerCase();
+  const tickerUp = d.ticker||'';
+  // Estatais conhecidas
+  // Apenas empresas com controle estatal ATUAL (governo federal ou estadual majoritário)
+  const estatais = {
+    // Federal — controle direto da União
+    'PETR4': 'Petrobras — União detém ~36% + golden share',
+    'PETR3': 'Petrobras — União detém ~36% + golden share',
+    'BBAS3': 'Banco do Brasil — União detém ~50%',
+    // Estaduais — controle de governo estadual
+    'SAPR4': 'Sanepar — Governo do Paraná majoritário',
+    'SAPR3': 'Sanepar — Governo do Paraná majoritário',
+    'SAPR11':'Sanepar — Governo do Paraná majoritário',
+    'SBSP3': 'Sabesp — Estado de SP ainda majoritário (privatização parcial 2024)',
+    'CSMG3': 'Copasa — Governo de Minas Gerais majoritário',
+    'CMIG4': 'Cemig — Governo de Minas Gerais majoritário',
+    'CMIG3': 'Cemig — Governo de Minas Gerais majoritário',
+    'BRSR6': 'Banrisul — Governo do RS majoritário',
+    'CESP6': 'CESP — Governo de SP com participação relevante',
+    // Privatizadas recentemente — golden share ou participação residual
+    'ELET3': 'Eletrobras — privatizada 2022, União mantém golden share',
+    'ELET6': 'Eletrobras — privatizada 2022, União mantém golden share',
+    'CPLE6': 'Copel — privatizada 2023, Estado do PR mantém golden share',
+    'CPLE3': 'Copel — privatizada 2023, Estado do PR mantém golden share',
   };
-  fetch('/scanner', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  })
-  .then(r => r.json())
-  .then(data => {
-    clearInterval(interval);
-    fill.style.width = '100%';
-    txt.textContent = 'Concluído!';
-    setTimeout(() => { prog.classList.remove('visible'); }, 800);
+  // VALE3, CSNA3, GGBR4 etc — privadas, sem controle estatal
+  if(estatais[tickerUp]) alertas.push('EMPRESA ESTATAL - ' + estatais[tickerUp]);
+  if(setorLower.includes('petro')||setorLower.includes('petró')) alertas.push('Setor de Petróleo - Interferência Governamental');
+  if(setorLower.includes('saneam')) alertas.push('Saneamento - Dependência de Tarifas Reguladas');
+  if(setorLower.includes('minera')) alertas.push('Mineração - Risco de Royalties e Regulação Ambiental');
+  if(dd.div_patrim > 2.5) alertas.push('Endividamento muito elevado - Risco de Reestruturação');
 
-    if (data.erro) { alert('Erro: ' + data.erro); return; }
-    renderResultados(data.resultados);
-
-    btn.disabled = false;
-    btn.textContent = '⚡ ESCANEAR MERCADO';
-  })
-  .catch(err => {
-    clearInterval(interval);
-    prog.classList.remove('visible');
-    alert('Erro na conexão: ' + err);
-    btn.disabled = false;
-    btn.textContent = '⚡ ESCANEAR MERCADO';
-  });
-}
-
-function renderResultados(resultados) {
-  const section = document.getElementById('results-section');
-  const cards   = document.getElementById('result-cards');
-  const summary = document.getElementById('results-summary');
-
-  const comSinal  = resultados.filter(r => r.sinal && !r.erro);
-  const semSinal  = resultados.filter(r => !r.sinal && !r.erro);
-  const erros     = resultados.filter(r => r.erro);
-
-  summary.innerHTML =
-    `<div class="sum-badge sinal">✅ ${comSinal.length} COM SINAL</div>` +
-    `<div class="sum-badge sem-sinal">⏳ ${semSinal.length} SEM SINAL</div>` +
-    (erros.length ? `<div class="sum-badge sem-sinal">❌ ${erros.length} ERRO</div>` : '');
-
-  // Ordenar: com sinal primeiro
-  const ordenados = [...comSinal, ...semSinal, ...erros];
-
-  if (comSinal.length === 0 && semSinal.length > 0) {
-    cards.innerHTML = `<div class="no-signal-box">
-      <div class="no-signal-icon">⏳</div>
-      <div class="no-signal-title">NENHUMA AÇÃO COM SINAL</div>
-      <div class="no-signal-sub">A estratégia EMA 9.1 não encontrou sinal ativo nas ações escaneadas no momento.<br>
-      Tente novamente mais tarde ou ajuste os parâmetros.</div>
-    </div>`;
+  const apEl = $('alertaPolitico');
+  if(alertas.length > 0){
+    $('alertaPoliticoItems').innerHTML = alertas.map(a=>`- ${a}`).join('<br>');
+    apEl.classList.add('on');
   } else {
-    cards.innerHTML = ordenados.map(r => {
-      if (r.erro) return `<div class="result-card sem-sinal">
-        <div class="rc-header"><span class="rc-ticker no-sinal">${r.ticker}</span>
-          <span class="rc-badge no-sinal">ERRO</span></div>
-        <div class="rc-erro">${r.erro}</div></div>`;
-
-      const cs = r.sinal ? 'com-sinal' : 'sem-sinal';
-      const ct = r.sinal ? 'sinal' : 'no-sinal';
-      const bt = r.sinal ? 'sinal' : 'no-sinal';
-      const quando = r.sinal_candle === 0 ? 'HOJE' : r.sinal_candle === 1 ? 'ONTEM' : '2 DIAS ATRÁS';
-      const bl = r.sinal ? `✅ SINAL — ${quando}` : '⏳ SEM SINAL';
-      const lp_c = r.lp_total >= 0 ? '#00ff88' : '#ff4455';
-      const pf_c = r.profit_factor >= 1.5 ? '#00ff88' : (r.profit_factor >= 1 ? '#ffd700' : '#ff4455');
-      const wr_c = r.win_rate >= 50 ? '#00ff88' : (r.win_rate >= 30 ? '#ffd700' : '#ff4455');
-      const dd_c = r.max_dd < 20 ? '#00ff88' : (r.max_dd < 30 ? '#ffd700' : '#ff4455');
-
-      return `<div class="result-card ${cs}">
-        <div class="rc-header">
-          <span class="rc-ticker ${ct}">${r.ticker}</span>
-          <span class="rc-badge ${bt}">${bl}</span>
-        </div>
-        <div class="rc-cotacao">Cotação: <strong>R$ ${r.cotacao.toFixed(2)}</strong></div>
-        ${r.estrategia === 'volume'
-          ? `<div class="rc-emas">
-              <div class="rc-ema e9" style="color:#ffd700;border-color:rgba(255,215,0,0.3)">📊 Vol: ${r.volume_atual ? r.volume_atual.toLocaleString('pt-BR') : '—'}</div>
-              <div class="rc-ema e50">Média(${r.volume_media ? r.volume_media.toLocaleString('pt-BR') : '—'})</div>
-              <div class="rc-ema e9" style="color:#ffd700;border-color:rgba(255,215,0,0.3)">${r.volume_mult_real ? r.volume_mult_real + 'x média' : ''}</div>
-            </div>`
-          : `<div class="rc-emas">
-              <div class="rc-ema e9">EMA9: ${r.ema9.toFixed(2)}</div>
-              <div class="rc-ema e50">EMA50: ${r.ema50.toFixed(2)}</div>
-            </div>`
-        }
-        <div class="rc-metrics">
-          <div class="rc-metric">
-            <div class="rc-metric-label">L&P Total</div>
-            <div class="rc-metric-value" style="color:${lp_c}">${r.lp_total > 0 ? '+' : ''}${r.lp_total.toFixed(1)}%</div>
-          </div>
-          <div class="rc-metric">
-            <div class="rc-metric-label">Drawdown Máx.</div>
-            <div class="rc-metric-value" style="color:${dd_c}">${r.max_dd.toFixed(1)}%</div>
-          </div>
-          <div class="rc-metric">
-            <div class="rc-metric-label">Negociações</div>
-            <div class="rc-metric-value" style="color:var(--text)">${r.total_trades}</div>
-          </div>
-          <div class="rc-metric">
-            <div class="rc-metric-label">Lucrativas</div>
-            <div class="rc-metric-value" style="color:${wr_c}">${r.wins}/${r.total_trades} (${r.win_rate.toFixed(0)}%)</div>
-          </div>
-          <div class="rc-metric">
-            <div class="rc-metric-label">Fator de Lucro</div>
-            <div class="rc-metric-value" style="color:${pf_c}">${r.profit_factor.toFixed(2)}</div>
-          </div>
-          <div class="rc-metric">
-            <div class="rc-metric-label">Win Rate</div>
-            <div class="rc-metric-value" style="color:${wr_c}">${r.win_rate.toFixed(1)}%</div>
-          </div>
-        </div>
-        <div class="rc-aprovada ${r.aprovada ? 'ok' : 'nok'}">
-          ${r.aprovada ? '🎉 ESTRATÉGIA APROVADA NESTA AÇÃO' : '❌ ESTRATÉGIA REPROVADA NESTA AÇÃO'}
-        </div>
-      </div>`;
-    }).join('');
+    apEl.classList.remove('on');
   }
 
-  section.classList.add('visible');
-  section.scrollIntoView({behavior: 'smooth', block: 'start'});
+  // Preço Justo
+  $('precoCard').innerHTML='<div class="pc-lbl">ESTIMATIVA DE PREÇO JUSTO</div>'
+    +'<div class="pc-grid">'
+    +(pj.graham?`<div><div class="pc-il">GRAHAM</div><div class="pc-iv">R$ ${fmt(pj.graham)}</div><div class="pc-is">√(22.5 × LPA × VPA)</div></div>`:'')
+    +(pj.pl_justo?`<div><div class="pc-il">P/L JUSTO</div><div class="pc-iv">R$ ${fmt(pj.pl_justo)}</div><div class="pc-is">LPA × (8.5 + 2g)</div></div>`:'')
+    +(pj.bazin?`<div><div class="pc-il">BAZIN</div><div class="pc-iv">R$ ${fmt(pj.bazin)}</div><div class="pc-is">Dividendo ÷ 6%</div></div>`:'')
+    +(pj.roe_ke?`<div><div class="pc-il">ROE/Ke</div><div class="pc-iv">R$ ${fmt(pj.roe_ke)}</div><div class="pc-is">P/VP Justo × VPA</div></div>`:'')
+    +'</div>'
+    +(pj.media?`<div class="pc-bottom">
+      <div>
+        <div style="font-family:'DM Mono',monospace;font-size:10px;color:rgba(255,255,255,.4);letter-spacing:2px;margin-bottom:5px">PREÇO ALVO</div>
+        <div style="font-family:'DM Serif Display',serif;font-size:34px;color:var(--gold2)">R$ ${fmt(pj.media)}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:'DM Mono',monospace;font-size:10px;color:rgba(255,255,255,.4);letter-spacing:2px;margin-bottom:5px">PREÇO ATUAL</div>
+        <div style="font-family:'DM Serif Display',serif;font-size:34px;color:#fff">R$ ${fmt(dd.preco)}</div>
+        <div style="font-size:12px;font-family:'DM Mono',monospace;margin-top:4px;color:${mg>=0?'#22c55e':'#ef4444'}">
+          ${mg>=0?'▲ desconto de':'▼ prêmio de'} ${fmt(Math.abs(mg),1)}%
+        </div>
+      </div>
+    </div>`:'');
+
+  // Análise textual gerada localmente
+  const analise=d.analise;
+  $('analiseBody').innerHTML=[
+    {l:'EMPRESA E SETOR',        t:analise.empresa},
+    {l:'AVALIAÇÃO DE PREÇO',     t:analise.preco},
+    {l:'PONTOS DE ATENÇÃO',      t:analise.atencao},
+    {l:'PERSPECTIVA',            t:analise.perspectiva},
+  ].filter(s=>s.t).map(s=>`
+    <div class="analise-section">
+      <div class="a-label">${s.l}</div>
+      <div class="a-text">${s.t}</div>
+    </div>
+  `).join('');
+
+  // Critérios
+  const ic={pass:'✓',fail:'✗',warn:'!'};
+  $('critList').innerHTML=d.criterios.map(c=>`
+    <div class="crit">
+      <div class="c-ic ${c.status}">${ic[c.status]}</div>
+      <div class="c-body"><div class="c-nome">${c.nome}</div><div class="c-det">${c.detalhe}</div></div>
+      <div class="c-badge ${c.status}">${c.badge}</div>
+    </div>
+  `).join('');
+
+  // Contexto Setorial
+  renderContextoSetor(d.contexto_setor, d.dados.dolar);
+
+  // Qualitativa
+  renderQualitativa(d.qualitativa, sc);
+
+  $('result').style.display='block';
+  $('result').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-// Init
-renderTickers();
+function renderContextoSetor(ctx, dolar) {
+  const el = document.getElementById('contextoSetorCard');
+  if (!ctx) { el.style.display='none'; return; }
+  const cor = ctx.cor || 'amarelo';
+  el.style.display = 'block';
+
+  // Bloco dólar
+  let dolarHtml = '';
+  if (dolar && dolar > 0 && ctx.dolar_tipo) {
+    const dolarCor = ctx.dolar_tipo === 'positivo' ? '#16a34a' : ctx.dolar_tipo === 'negativo' ? '#dc2626' : '#92400e';
+    const dolarEmoji = ctx.dolar_tipo === 'positivo' ? '💚' : ctx.dolar_tipo === 'negativo' ? '🔴' : '🟡';
+    const dolarLabel = ctx.dolar_tipo === 'positivo' ? 'FAVORÁVEL' : ctx.dolar_tipo === 'negativo' ? 'PRESSÃO' : 'NEUTRO';
+    dolarHtml = `
+      <div class="cs-dolar" style="border-top:1px solid rgba(0,0,0,.08);margin-top:10px;padding-top:10px;
+        display:flex;align-items:flex-start;gap:10px">
+        <span style="font-size:16px">💵</span>
+        <div>
+          <span style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:1px;
+            font-weight:700;color:${dolarCor}">${dolarEmoji} DÓLAR R$${dolar.toFixed(2).replace('.',',')} · ${dolarLabel}</span>
+          <div style="font-size:11px;color:inherit;margin-top:2px;font-weight:300;opacity:.8">${ctx.dolar_texto}</div>
+        </div>
+      </div>`;
+  }
+
+  el.innerHTML = `
+    <div class="contexto-setor ${cor}">
+      <div class="cs-header">
+        <div class="cs-titulo">${ctx.emoji} CONTEXTO SETORIAL · ${ctx.nome.toUpperCase()}</div>
+        <div class="cs-badge">${ctx.status}</div>
+      </div>
+      <div class="cs-texto">${ctx.texto}</div>
+      ${dolarHtml}
+    </div>`;
+}
+
+function renderQualitativa(q, scoreQuant) {
+  if (!q) {
+    document.getElementById('qualBody').innerHTML =
+      '<div class="qual-loading" style="color:var(--ink3)">Análise qualitativa indisponível no momento.</div>';
+    return;
+  }
+  const scoreQual = q.score_qualitativo || 0;
+  const scoreFinal = Math.round(scoreQuant * 0.6 + scoreQual * 0.4);
+
+  // Score badge
+  const badge = document.getElementById('qualScoreBadge');
+  badge.textContent = scoreQual + '/100';
+  badge.style.display = 'block';
+  badge.style.background = scoreQual >= 65 ? 'var(--green)' : scoreQual >= 40 ? 'var(--gold)' : 'var(--red2)';
+
+  // Score final
+  document.getElementById('scoreFinalCard').style.display = 'flex';
+  document.getElementById('sfScore').textContent = scoreFinal + '%';
+  document.getElementById('sfScore').style.color = scoreFinal >= 65 ? 'var(--green2)' : scoreFinal >= 40 ? 'var(--gold2)' : 'var(--red2)';
+  setTimeout(() => {
+    document.getElementById('sfBarQuant').style.width = scoreQuant + '%';
+    document.getElementById('sfValQuant').textContent = scoreQuant + '%';
+    document.getElementById('sfBarQual').style.width = scoreQual + '%';
+    document.getElementById('sfValQual').textContent = scoreQual + '%';
+  }, 200);
+
+  // Critérios
+  const nivelClass = n => n === 'FORTE' ? 'forte' : n === 'FRACO' ? 'fraco' : 'medio';
+  const nivelLabel = n => n === 'FORTE' ? 'FORTE' : n === 'FRACO' ? 'FRACO' : 'MÉDIO';
+  const criteriosHtml = (q.criterios || []).map(c => {
+    const nc = nivelClass(c.nivel);
+    const pct = Math.round((c.nota / 20) * 100);
+    return `<div class="qc">
+      <div class="qc-bar-wrap">
+        <div class="qc-bar-bg"><div class="qc-bar-fill ${nc}" style="width:${pct}%"></div></div>
+        <div class="qc-nota">${c.nota}/20</div>
+      </div>
+      <div class="qc-body">
+        <div class="qc-nome">${c.nome}</div>
+        <div class="qc-just">${c.justificativa}</div>
+      </div>
+      <div class="qc-nivel ${nc}">${nivelLabel(c.nivel)}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('qualBody').innerHTML =
+    '<div class="qual-criterios">' + criteriosHtml + '</div>' +
+    (q.resumo ? `<div class="qual-resumo">${q.resumo}</div>` : '');
+}
+
+$('inp').addEventListener('input',e=>{e.target.value=e.target.value.toUpperCase();});
+$('inp').addEventListener('keydown',e=>{if(e.key==='Enter')analisar();});
+
+// ── TABS ──
+function switchTab(tab){
+  // Esconder todas as tabs
+  ['tabAnalise','tabScreener'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.style.display='none';
+  });
+  // Remover active dos botões
+  document.querySelectorAll('.tab-nav-btn').forEach(b=>b.classList.remove('active'));
+  // Mostrar a tab selecionada
+  const show=tab==='analise'?'tabAnalise':'tabScreener';
+  const el=document.getElementById(show);
+  if(el) el.style.display='block';
+  // Ativar botão
+  const btnId=tab==='analise'?'tabBtnAnalise':'tabBtnScreener';
+  const btn=document.getElementById(btnId);
+  if(btn) btn.classList.add('active');
+  // Scroll para as tabs
+  document.querySelector('.tabs-nav').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+// ── SCREENER ──
+async function rodarScreener(){
+  const raw = $('scrInput').value;
+  const tickers = raw.toUpperCase().split(/[,;\s]+/).map(t=>t.trim()).filter(t=>/^[A-Z]{4}[0-9]{1,2}$/.test(t));
+  if(!tickers.length){
+    $('scrResultado').innerHTML='<div style="color:var(--red2);font-family:monospace;font-size:12px;padding:12px">Nenhum ticker válido encontrado. Use formato: PETR4, VALE3...</div>';
+    return;
+  }
+  const btn=$('btnScr'); btn.disabled=true; btn.textContent='⏳ Analisando...';
+  $('scrResultado').innerHTML='';
+  const resultados=[];
+  for(let i=0;i<tickers.length;i++){
+    const tk=tickers[i];
+    $('scrProg').textContent=`Analisando ${tk}... (${i+1}/${tickers.length})`;
+    try{
+      const r=await fetch('/analisar?ticker='+tk);
+      const d=await r.json();
+      if(d.erro) resultados.push({ticker:tk,erro:d.erro});
+      else resultados.push({ticker:tk,...d});
+    }catch(e){resultados.push({ticker:tk,erro:'Falha de conexão'});}
+    // Pequena pausa para não sobrecarregar
+    await new Promise(res=>setTimeout(res,400));
+  }
+  $('scrProg').textContent=`✓ ${tickers.length} ações analisadas`;
+  btn.disabled=false; btn.textContent='📊 Gerar Ranking →';
+  renderRanking(resultados);
+}
+
+function renderRanking(resultados){
+  // Separar erros dos válidos
+  const validos=resultados.filter(r=>!r.erro);
+  const erros=resultados.filter(r=>r.erro);
+
+  // Ordenar por score_final desc
+  validos.sort((a,b)=>(b.score_final||0)-(a.score_final||0));
+
+  let html='<div class="ranking-card">';
+  html+=`<div class="ranking-hdr">
+    <span class="rh-title">RANKING · SCORE FINAL</span>
+    <span class="rh-count">${validos.length} ações ordenadas</span>
+  </div>`;
+
+  if(!validos.length){
+    html+='<div style="padding:20px;color:var(--ink4);font-size:13px">Nenhuma ação analisada com sucesso.</div>';
+  }
+
+  validos.forEach((r,i)=>{
+    const pos=i+1;
+    const numClass=pos===1?'gold':pos===2?'silver':pos===3?'bronze':'';
+    const d=r.dados||{};
+    const sf=r.score_final||0;
+    const scoreClass=sf>=70?'alto':sf>=50?'medio':'baixo';
+    const preco=d.preco||0;
+    const alvo=r.preco_alvo||0;
+    const desc=alvo>0&&preco>0?((alvo-preco)/preco*100):0;
+    const descClass=desc>0?'pos':'neg';
+    const descTxt=desc!==0?(desc>0?'▲ +':'▼ ')+Math.abs(desc).toFixed(1)+'%':'—';
+    const sinalEmoji=r.sinal==='compra'?'✦':r.sinal==='neutro'?'◆':'✕';
+    const sinalColor=r.sinal==='compra'?'var(--green)':r.sinal==='neutro'?'var(--gold)':'var(--red2)';
+    const setor=r.setor_detectado||d.setor||'—';
+    const ctx=r.contexto_setor;
+    const ctxEmoji=ctx?ctx.emoji:'🏢';
+    const ctxCor=ctx?ctx.cor:'cinza';
+    const ctxCorVar=ctxCor==='verde'?'var(--green)':ctxCor==='vermelho'?'var(--red2)':'var(--gold)';
+
+    // Impacto do dólar
+    const dolarTipo = ctx?ctx.dolar_tipo:null;
+    const dolarVal  = d.dolar||0;
+    let dolarBadge  = '';
+    if(dolarTipo && dolarVal>0){
+      const dEmoji = dolarTipo==='positivo'?'💚':dolarTipo==='negativo'?'🔴':'⚪';
+      const dTxt   = dolarTipo==='positivo'?'USD FAVORECE':dolarTipo==='negativo'?'USD PRESSIONA':'USD NEUTRO';
+      const dColor = dolarTipo==='positivo'?'#22c55e':dolarTipo==='negativo'?'#ef4444':'#94a3b8';
+      dolarBadge   = `<span style="font-size:9px;font-family:'DM Mono',monospace;letter-spacing:.5px;
+        color:${dColor};border:1px solid ${dColor};padding:1px 6px;border-radius:8px;
+        white-space:nowrap;opacity:.85">${dEmoji} ${dTxt}</span>`;
+    }
+
+    html+=`<div class="rk-item" onclick="irParaAnalise('${r.ticker}')">
+      <div class="rk-num ${numClass}">${pos}</div>
+      <div class="rk-body">
+        <div class="rk-top">
+          <span class="rk-ticker">${r.ticker}</span>
+          <span class="rk-empresa">${d.empresa||r.ticker}</span>
+          <span class="rk-setor">${setor}</span>
+          <span class="rk-ctx" title="${ctx?ctx.nome:''}">${ctxEmoji}</span>
+        </div>
+        <div class="rk-bottom">
+          <span class="rk-preco">R$ ${preco.toFixed(2).replace('.',',')}</span>
+          <span class="rk-alvo">→ Alvo R$ ${alvo>0?alvo.toFixed(2).replace('.',','):'—'}</span>
+          <span class="rk-desc ${descClass}">${descTxt}</span>
+          <span style="font-size:11px;color:${sinalColor};font-weight:700">${sinalEmoji} ${(r.sinal||'—').toUpperCase()}</span>
+          ${dolarBadge}
+        </div>
+      </div>
+      <div class="rk-right">
+        <div class="rk-sinal" style="color:${ctxCorVar}">${ctxEmoji}</div>
+        <div class="rk-score ${scoreClass}">${sf.toFixed(0)}%</div>
+        <div class="rk-scorelbl">SCORE</div>
+      </div>
+    </div>`;
+  });
+
+  // Erros no final
+  erros.forEach(r=>{
+    html+=`<div class="rk-erro">⚠ ${r.ticker} — ${r.erro}</div>`;
+  });
+
+  html+='</div>';
+
+  // Resumo estatístico
+  if(validos.length>1){
+    const compra=validos.filter(r=>r.sinal==='compra').length;
+    const neutro=validos.filter(r=>r.sinal==='neutro').length;
+    const evitar=validos.filter(r=>r.sinal==='evitar').length;
+    const mediaScore=(validos.reduce((s,r)=>s+(r.score_final||0),0)/validos.length).toFixed(1);
+    html+=`<div style="background:var(--paper);border:1px solid var(--border);border-radius:12px;
+      padding:18px 22px;display:flex;gap:28px;flex-wrap:wrap;align-items:center">
+      <div style="font-family:'DM Mono',monospace;font-size:9px;letter-spacing:2px;color:var(--ink4)">RESUMO DO LOTE</div>
+      <div style="font-size:13px">✦ <b style="color:var(--green)">${compra}</b> compra</div>
+      <div style="font-size:13px">◆ <b style="color:var(--gold)">${neutro}</b> neutro</div>
+      <div style="font-size:13px">✕ <b style="color:var(--red2)">${evitar}</b> evitar</div>
+      <div style="font-size:13px">📊 Score médio: <b>${mediaScore}%</b></div>
+    </div>`;
+  }
+
+  $('scrResultado').innerHTML=html;
+}
+
+function irParaAnalise(ticker){
+  switchTab('analise');
+  $('inp').value=ticker;
+  analisar();
+}
+
 </script>
-</body></html>'''
+</body>
+</html>"""
+
+# ─── Coleta de dados ──────────────────────────────────────────────────────────
+def fetch(url, timeout=12):
+    req = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "Referer": "https://www.fundamentus.com.br/",
+    })
+    import gzip
+    resp = urlopen(req, timeout=timeout)
+    raw = resp.read()
+    # Descomprime gzip se necessário
+    try:
+        raw = gzip.decompress(raw)
+    except:
+        pass
+    return raw.decode("utf-8", errors="ignore")
+
+def fetch_json(url, timeout=8):
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    return json.loads(urlopen(req, timeout=timeout).read().decode())
+
+def num(texto):
+    """Converte string brasileira para float. Ex: '1.234,56' -> 1234.56"""
+    if not texto: return 0.0
+    t = re.sub(r'[^\d,.\-]', '', texto.strip())
+    if ',' in t and '.' in t:
+        t = t.replace('.', '').replace(',', '.')
+    elif ',' in t:
+        t = t.replace(',', '.')
+    try: return float(t)
+    except: return 0.0
+
+def buscar_fundamentus(ticker):
+    """Busca dados reais do Fundamentus com múltiplos padrões robustos"""
+    html = fetch(f"https://www.fundamentus.com.br/detalhes.php?papel={ticker.upper()}")
+
+    # Ticker inválido — página vazia ou sem resultados
+    if len(html) < 1000 or "Nenhum papel encontrado" in html:
+        return {"ticker": ticker.upper(), "preco": 0.0, "empresa": ticker.upper(), "_pagina_invalida": True}
+
+    d = {"ticker": ticker.upper(), "_pagina_invalida": False}
+
+    def strip(s):
+        return re.sub(r'<[^>]+>', '', s).strip()
+
+    # ── Nome da empresa ──
+    for pat in [
+        r'id="ctl00_cph1_lblNome"[^>]*>(.*?)</span>',
+        r'lblNome[^>]*>(.*?)</span>',
+        r'Empresa\s*</td>\s*<td[^>]*>(.*?)</td>',
+    ]:
+        m = re.search(pat, html, re.DOTALL | re.I)
+        if m and strip(m.group(1)):
+            d["empresa"] = strip(m.group(1)); break
+    else:
+        d["empresa"] = ticker.upper()
+
+    # ── Setor ──
+    for pat in [
+        r'Subsetor\s*</td>\s*<td[^>]*>(.*?)</td>',
+        r'Setor\s*</td>\s*<td[^>]*>(.*?)</td>',
+    ]:
+        m = re.search(pat, html, re.DOTALL | re.I)
+        if m and strip(m.group(1)):
+            d["setor"] = strip(m.group(1)); break
+    else:
+        d["setor"] = "—"
+
+    # ── Extrator genérico: parse de TODOS os pares label->valor da tabela ──
+    tabela_dados = {}
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.I)
+    for row in rows:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.I)
+        i = 0
+        while i < len(cells) - 1:
+            label_cell = strip(cells[i]).replace(' ', ' ').strip()
+            value_cell = strip(cells[i+1]).replace(' ', ' ').strip()
+            if label_cell and value_cell and re.search(r'[\d]', value_cell):
+                tabela_dados[label_cell] = value_cell
+            i += 2
+
+    def get_val(label):
+        # Busca exata
+        if label in tabela_dados:
+            return tabela_dados[label]
+        # Busca parcial normalizada
+        label_norm = label.lower().replace('.', '').replace(' ', '')
+        for k, v in tabela_dados.items():
+            if label_norm in k.lower().replace('.', '').replace(' ', ''):
+                return v
+        return ""
+
+    # ── Preço: busca robusta em cascata ──
+    preco = 0.0
+
+    # Estratégia 1: percorre tabela_dados e acha qualquer chave que contenha "cota"
+    # Remove TODOS os chars não-alfanuméricos antes de comparar (fix do ?Cotao, Cotação, etc)
+    for k, v in tabela_dados.items():
+        k_clean = re.sub(r'[^a-zA-Z]', '', k.lower()
+            .replace('ç', 'c').replace('ã', 'a').replace('à', 'a')
+            .replace('á', 'a').replace('â', 'a').replace('ä', 'a')
+            .replace('õ', 'o').replace('ó', 'o').replace('ô', 'o')
+        )
+        if k_clean.startswith('cota') or k_clean == 'cotacao':
+            parsed = num(v)
+            if parsed > 0:
+                preco = parsed
+                break
+
+    # Estratégia 2: regex com IDs conhecidos
+    if preco == 0:
+        for pat in [
+            r'id="ctl00_cph1_lblCotacao"[^>]*>([\d.,]+)',
+            r'lblCotacao[^>]*>([\d.,]+)',
+        ]:
+            m = re.search(pat, html, re.DOTALL | re.I)
+            if m:
+                v = num(m.group(1))
+                if v > 0:
+                    preco = v
+                    break
+
+    # Estratégia 3: regex genérico — qualquer célula com "cota" seguida de número
+    if preco == 0:
+        m = re.search(r'Cota[^<]{0,20}</td>\s*<td[^>]*>\s*(?:<[^>]+>)*([\d.,]+)', html, re.DOTALL | re.I)
+        if m:
+            v = num(m.group(1))
+            if v > 0:
+                preco = v
+
+    # Estratégia 4: primeiro número após "cota" no HTML
+    if preco == 0:
+        idx = html.lower().find('cota')
+        if idx >= 0:
+            ns = re.findall(r'>([\d]+[.,][\d]{2})<', html[idx:idx+800])
+            for n in ns:
+                v = num(n)
+                if v > 0:
+                    preco = v
+                    break
+
+    # ── Fallback: se preco ainda 0, busca via Yahoo Finance ──
+    if preco == 0:
+        chaves = list(tabela_dados.keys())
+        print(f"  ⚠️  preco=0 via Fundamentus para {ticker}. Tentando Yahoo Finance...")
+        print(f"  Chaves encontradas: {chaves[:15]}")
+        try:
+            yf_data = fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.SA?interval=1d&range=1d")
+            yf_preco = yf_data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            if yf_preco and yf_preco > 0:
+                preco = round(float(yf_preco), 2)
+                print(f"  ✅ Preço via Yahoo Finance: R${preco:.2f}")
+        except Exception as e:
+            print(f"  ❌ Yahoo Finance também falhou: {e}")
+
+    d["preco"] = preco
+
+    # ── Indicadores ──
+    for label, campo in [
+        ("P/L","pl"), ("P/VP","pvp"), ("P/EBIT","p_ebit"),
+        ("Div. Yield","dy"), ("ROE","roe"), ("ROIC","roic"),
+        ("LPA","lpa"), ("VPA","vpa"),
+        ("Marg. Bruta","marg_bruta"), ("Marg. EBIT","marg_ebit"),
+        ("Marg. Líquida","marg_liq"), ("Dív. Bruta/Patrim.","div_patrim"),
+        ("Liquidez Corr","liq_corr"), ("Cresc. Rec. 5a","cresc_5a"),
+        ("EV/EBITDA","ev_ebitda"), ("Giro Ativos","giro_ativos"),
+        ("Dív. Líquida","div_liquida"),
+    ]:
+        d[campo] = num(get_val(label))
+
+    # Dividendos estimados
+    d["dividendo12m"] = round(d["preco"] * d["dy"] / 100, 2) if d.get("dy") and d.get("preco") else 0.0
+
+    return d
 
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok', 'usuarios_ativos': _usuarios_ativos})
+def buscar_investidor10(ticker):
+    """Busca dados complementares do Investidor10"""
+    extra = {}
+    try:
+        html = fetch(f"https://investidor10.com.br/acoes/{ticker.lower()}/", timeout=10)
+
+        # P/L
+        m = re.search(r'P/L.*?<span[^>]*>([\d.,]+)</span>', html, re.DOTALL | re.I)
+        if m: extra["pl_i10"] = num(m.group(1))
+
+        # DY
+        m = re.search(r'Dividend Yield.*?<span[^>]*>([\d.,]+)\s*%', html, re.DOTALL | re.I)
+        if m: extra["dy_i10"] = num(m.group(1))
+
+        # ROE
+        m = re.search(r'\bROE\b.*?<span[^>]*>([\d.,]+)\s*%', html, re.DOTALL | re.I)
+        if m: extra["roe_i10"] = num(m.group(1))
+
+        # Payout
+        m = re.search(r'Payout.*?<span[^>]*>([\d.,]+)\s*%', html, re.DOTALL | re.I)
+        if m: extra["payout"] = num(m.group(1))
+
+        # Crescimento de lucro
+        m = re.search(r'Cresc.*?Lucro.*?<span[^>]*>([\d.,\-]+)\s*%', html, re.DOTALL | re.I)
+        if m: extra["cresc_lucro"] = num(m.group(1))
+
+    except:
+        pass
+    return extra
 
 
-if __name__ == '__main__':
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+def buscar_dolar():
+    """Cotação atual do dólar — múltiplos fallbacks"""
+    # Fonte 1: AwesomeAPI
+    try:
+        data = fetch_json("https://economia.awesomeapi.com.br/json/last/USD-BRL")
+        val = float(data["USDBRL"]["bid"])
+        if val > 0: return round(val, 2)
+    except: pass
+    # Fonte 2: Yahoo Finance
+    try:
+        data = fetch_json("https://query1.finance.yahoo.com/v8/finance/chart/USDBRL=X?interval=1d&range=1d")
+        val = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if val > 0: return round(float(val), 2)
+    except: pass
+    # Fonte 3: BCB PTAX última disponível
+    try:
+        from datetime import datetime, timedelta
+        for delta in range(0, 5):
+            dt = (datetime.now() - timedelta(days=delta)).strftime("%m-%d-%Y")
+            url = f"https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao='{dt}'&$top=1&$format=json&$select=cotacaoCompra"
+            data = fetch_json(url, timeout=6)
+            if data.get("value"):
+                return round(float(data["value"][0]["cotacaoCompra"]), 2)
+    except: pass
+    # Fallback fixo razoável
+    return 5.85
+
+def buscar_ipca():
+    """IPCA acumulado 12 meses - Banco Central"""
+    try:
+        data = fetch_json("https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados/ultimos/12?formato=json")
+        total = 1.0
+        for item in data:
+            total *= (1 + float(item["valor"].replace(",", ".")) / 100)
+        return round((total - 1) * 100, 2)
+    except:
+        return 4.83  # fallback
+
+def buscar_var(symbol):
+    """Variação mensal via Yahoo Finance"""
+    try:
+        data = fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1mo&range=2mo")
+        closes = [c for c in data["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c]
+        if len(closes) >= 2:
+            return round((closes[-1] / closes[-2] - 1) * 100, 2)
+    except:
+        pass
+    return 0.0
+
+
+# ─── Cálculo de Preço Justo ───────────────────────────────────────────────────
+def calcular_preco_justo(d, cresc=5, tipo="geral"):
+    lpa   = d.get("lpa", 0)
+    vpa   = d.get("vpa", 0)
+    div   = d.get("dividendo12m", 0)
+    roe   = d.get("roe", 0)
+    preco = d.get("preco", 0)
+    r = {}
+
+    # Graham: útil para valor/util/banco, distorce para crescimento
+    if lpa > 0 and vpa > 0 and tipo not in ("cresc",):
+        r["graham"] = round(math.sqrt(22.5 * lpa * vpa), 2)
+
+    # P/L Justo: NÃO usado para crescimento (LPA baixo distorce resultado)
+    if lpa > 0 and tipo not in ("cresc",):
+        r["pl_justo"] = round(lpa * (8.5 + 2 * cresc), 2)
+
+    # Bazin: faz sentido para dividendos/util, não para crescimento
+    if div > 0 and tipo not in ("cresc",):
+        r["bazin"] = round(div / 0.06, 2)
+
+    # ── Método P/L com crescimento real (validado vs consenso de analistas) ──
+    # Prioridade 1: cresc_5a real do Fundamentus (mais preciso)
+    # Prioridade 2: ROE × retenção setorial (fallback quando cresc_5a = 0)
+    # Referência: fórmula Graham modificada LPA × (8.5 + 2g), alinhada com sell-side
+    if tipo == "cresc" and lpa > 0 and roe > 0:
+        setor_str = (d.get("setor") or "").lower()
+        cresc_real = d.get("cresc_5a", 0) or 0
+
+        # Cap do g por ciclicidade do setor
+        eh_ciclico_g = any(x in setor_str for x in ["agrícol","agricol","agríco","sider","celulose","petro","minera","cicl","commod"])
+        cap_g = 7.0 if eh_ciclico_g else 20.0  # cíclicos: g máx 7%, crescimento: 20%
+
+        if cresc_real >= 5:
+            # Dado real disponível — usar diretamente com cap por ciclicidade
+            g_final = min(cresc_real, cap_g)
+        else:
+            # Fallback: retenção setorial × ROE
+            if any(x in setor_str for x in ["saúde","saude","hospital","medic","farm"]):
+                retencao = 0.38
+            elif any(x in setor_str for x in ["agrícol","agricol","agríco"]):
+                retencao = 0.28  # cíclico, retenção baixa
+            elif any(x in setor_str for x in ["tecnol","softw","inform"]):
+                retencao = 0.60
+            elif any(x in setor_str for x in ["varejo","comerci","consum"]):
+                retencao = 0.33
+            else:
+                retencao = 0.48  # indústria/máquinas/geral
+            g_final = max(8.0, min(roe * retencao, 20.0))
+
+        # LPA: corrige subdimensionamento do Fundamentus via preço/P.L atual
+        pl_atual = d.get("pl", 0) or 0
+        lpa_via_pl = (preco / pl_atual) if pl_atual > 0 and preco > 0 else 0
+        lpa_efetivo = max(lpa, lpa_via_pl * 0.90)
+
+        # Fórmula de valuation adaptada ao perfil
+        if eh_ciclico_g:
+            # Cíclicos: usar P/L de referência setorial (não Graham modificado)
+            # Graham superestima cíclicos porque g alto é temporário
+            pl_ref_ciclico = 12.0  # P/L justo para máquinas agrícolas/cíclicos
+            r["roe_ke"] = round(lpa_efetivo * pl_ref_ciclico, 2)
+        else:
+            # Crescimento secular: Graham modificado com g real
+            r["roe_ke"] = round(lpa_efetivo * (8.5 + 2 * g_final), 2)
+
+    if r:
+        media = sum(r.values()) / len(r)
+        # Cap de segurança: preço alvo não pode ser mais que 60% acima do preço atual
+        # Upsides >60% geralmente indicam dado distorcido (LPA subdimensionado, cresc_5a inflado)
+        if preco > 0:
+            cap_upside = preco * 1.60
+            if media > cap_upside:
+                media = cap_upside
+                r["alerta_cap"] = True  # flag para exibir aviso no frontend
+        r["media"]  = round(media, 2)
+        r["margem"] = round((media - preco) / media * 100, 1) if media > 0 else 0
+    else:
+        r["media"]  = 0
+        r["margem"] = 0
+
+    return r
+
+
+# ─── Score e Critérios ────────────────────────────────────────────────────────
+def calcular_score(d, pj, tipo="geral"):
+    pts = 0; mx = 0; cr = []
+
+    pl      = d.get("pl", 0)
+    pvp     = d.get("pvp", 0)
+    roe     = d.get("roe", 0)
+    dy      = d.get("dy", 0)
+    div     = d.get("dividendo12m", 0)
+    var_a   = d.get("var_mes", 0)
+    var_i   = d.get("var_ibov_mes", 0)
+    ipca    = d.get("ipca_12m", 0)
+    mg      = pj.get("margem", 0)
+    liq     = d.get("liq_corr", 0)
+    div_p   = d.get("div_patrim", 0)
+    marg_l  = d.get("marg_liq", 0)
+
+    plref  = {"banco":9,"util":14,"cicl":10,"cresc":35,"div":14,"valor":11,"geral":15}.get(tipo, 15)
+    pvpref = {"banco":1.2,"util":1.5,"cicl":1.2,"cresc":6.0,"div":2.0,"valor":1.0,"geral":2.5}.get(tipo, 2.5)
+    roeref = {"banco":12,"util":10,"cicl":12,"cresc":20,"div":12,"valor":10,"geral":12}.get(tipo, 12)
+    dyref  = {"banco":4,"util":5,"cicl":3,"cresc":1,"div":6,"valor":3,"geral":4}.get(tipo, 4)
+
+    def add(nome, status, badge, det, peso, ok_pts, warn_pts=0):
+        nonlocal pts, mx
+        cr.append({"nome": nome, "status": status, "badge": badge, "detalhe": det})
+        pts += ok_pts if status == "pass" else (warn_pts if status == "warn" else 0)
+        mx  += peso
+
+    # ── Pesos por critério e perfil ──
+    w_pl  = {"cresc":0.5, "div":1.5, "valor":2.0}.get(tipo, 1.0)
+    w_pvp = {"cresc":0.3, "div":1.0, "valor":2.0, "banco":2.0}.get(tipo, 1.0)
+    w_roe = {"cresc":2.5, "div":1.0, "valor":1.5, "banco":1.5}.get(tipo, 1.0)
+    w_dy  = {"cresc":0.3, "div":2.5, "util":2.0}.get(tipo, 1.0)
+    w_ms  = {"cresc":0.5, "div":1.5, "valor":2.5}.get(tipo, 1.0)
+
+    # ── Mensagens contextuais por perfil ──
+    def msg_pl(v):
+        if tipo == "cresc": return f"P/L {v:.1f}x — empresa de crescimento; múltiplo elevado é esperado se ROE e lucro crescem"
+        if tipo == "cicl":  return f"P/L {v:.1f}x — empresa cíclica; P/L pode estar distorcido pelo ciclo de commodities"
+        return f"P/L {v:.1f}x — {'atrativo' if v < plref else 'elevado'} para o perfil (referência: {plref}x)"
+    def msg_pvp(v):
+        if tipo == "cresc": return f"P/VP {v:.2f}x — prêmio justificado por ROE alto e crescimento consistente"
+        if tipo == "banco": return f"P/VP {v:.2f}x — múltiplo chave para bancos; abaixo de 1.2x é conservador"
+        return f"P/VP {v:.2f}x — {'desconto sobre patrimônio' if v<1 else 'dentro do esperado' if v<pvpref else 'acima do patrimônio'}"
+    def msg_roe(v):
+        if tipo == "cresc": return f"ROE {v:.1f}% — {'excelente' if v>=20 else 'bom'}, critério principal para empresa de crescimento"
+        if tipo == "banco": return f"ROE {v:.1f}% — {'acima da média bancária' if v>=15 else 'dentro do esperado para o setor'}"
+        return f"ROE {v:.1f}% — {'alta rentabilidade, gera valor' if v>=roeref else 'rentabilidade moderada' if v>=8 else 'baixa rentabilidade'}"
+    def msg_dy(v):
+        if tipo == "cresc": return f"DY {v:.1f}% — empresa de crescimento reinveste lucro; DY baixo é esperado e aceitável"
+        if tipo == "div":   return f"DY {v:.1f}% — {'excelente' if v>=dyref else 'abaixo do esperado para empresa focada em dividendos'}"
+        return f"DY {v:.1f}% — {'boa remuneração' if v>=dyref else 'dividendo modesto' if v>=2 else 'abaixo da inflação'}"
+
+    # 1. P/L — para crescimento usa PEG Ratio (P/L ÷ crescimento), muito mais justo
+    cresc5 = d.get("cresc_5a", 0) or 0
+    if tipo == "cresc" and cresc5 > 0 and pl > 0:
+        peg = pl / cresc5
+        plok = peg < 1.5;  plw = peg < 2.5
+        pl_detalhe = f"P/L {pl:.1f}x · PEG {peg:.2f} — {'excelente: crescimento justifica o múltiplo' if plok else 'aceitável para empresa de alto crescimento' if plw else 'múltiplo elevado mesmo ajustado pelo crescimento'}"
+        add("Preço / Lucro (P/L)",
+            "pass" if plok else "warn" if plw else "fail",
+            f"{pl:.1f}x (PEG {peg:.1f})",
+            pl_detalhe,
+            2*w_pl, 2*w_pl, 1*w_pl if plw else 0)
+    else:
+        plok = 0 < pl < plref; plw = 0 < pl < plref * 1.4
+        add("Preço / Lucro (P/L)",
+            "pass" if plok else "warn" if plw else "fail",
+            f"{pl:.1f}x" if pl > 0 else "N/A",
+            msg_pl(pl) if pl > 0 else "Empresa sem lucro no período",
+            2*w_pl, 2*w_pl, 1*w_pl if plw else 0)
+
+    # 2. P/VP — para crescimento: calcula P/VP justo via ROE/Ke
+    if tipo == "cresc" and roe > 0 and pvp > 0:
+        ke = 0.12  # custo de capital referência
+        g_perp = min(cresc5 / 100 if cresc5 > 0 else 0.05, 0.08)
+        pvp_justo = (roe / 100 - g_perp) / (ke - g_perp) if ke > g_perp else pvpref
+        pvp_justo = max(1.5, min(pvp_justo, 10.0))
+        pvpok = pvp < pvp_justo * 0.85; pvpw = pvp < pvp_justo * 1.15
+        pvp_det = f"P/VP {pvp:.2f}x · P/VP justo pelo ROE: {pvp_justo:.1f}x — {'abaixo do justo, prêmio não capturado' if pvpok else 'próximo do valor justo pelo ROE' if pvpw else 'acima do P/VP justo pelo ROE'}"
+        add("Preço / Patrimônio (P/VP)",
+            "pass" if pvpok else "warn" if pvpw else "fail",
+            f"{pvp:.2f}x (justo {pvp_justo:.1f}x)",
+            pvp_det,
+            1.5*w_pvp, 1.5*w_pvp, 0.7*w_pvp if pvpw else 0)
+    else:
+        pvpok = pvp < pvpref * 0.7; pvpw = pvp < pvpref
+        add("Preço / Patrimônio (P/VP)",
+            "pass" if pvpok else "warn" if pvpw else "fail",
+            f"{pvp:.2f}x",
+            msg_pvp(pvp),
+            1.5*w_pvp, 1.5*w_pvp, 0.7*w_pvp if pvpw else 0)
+
+    # 3. ROE — peso aumentado para crescimento
+    roeok = roe >= roeref; roew = roe >= roeref * 0.6
+    add("Retorno sobre Patrimônio (ROE)",
+        "pass" if roeok else "warn" if roew else "fail",
+        f"{roe:.1f}%",
+        msg_roe(roe),
+        2*w_roe, 2*w_roe, 0.8*w_roe if roew else 0)
+
+    # 4. DY — peso reduzido para crescimento, aumentado para dividendos
+    dyok = dy >= dyref; dyw = dy >= dyref * 0.5
+    add("Dividend Yield",
+        "pass" if dyok else "warn" if dyw else "fail",
+        f"{dy:.1f}%" if div > 0 else "—",
+        msg_dy(dy),
+        1*w_dy, 1*w_dy, 0.4*w_dy if dyw else 0)
+
+    # 5. Margem de Segurança — peso menor para crescimento (Graham subestima)
+    msok = mg >= 25; msw = mg >= 0
+    if tipo == "cresc":
+        ms_det = f"Preço {abs(mg):.1f}% {'abaixo' if mg>0 else 'acima'} do valor justo — para crescimento, Graham pode subestimar o valor real"
+    else:
+        ms_det = f"Preço {mg:.1f}% {'abaixo do valor justo — boa margem de segurança' if mg>0 else 'acima do valor justo — risco de sobrevalorização'}"
+    add("Margem de Segurança",
+        "pass" if msok else "warn" if msw else "fail",
+        f"+{mg:.1f}%" if mg > 0 else f"{mg:.1f}%",
+        ms_det,
+        2*w_ms, 2*w_ms, 0.5*w_ms if msw else 0)
+
+    # 6. Liquidez Corrente
+    liqok = liq >= 1.5; liqw = liq >= 1.0
+    add("Liquidez Corrente",
+        "pass" if liqok else "warn" if liqw else "fail",
+        f"{liq:.2f}x",
+        f"Liquidez {liq:.2f}x — {'empresa saudável financeiramente no curto prazo' if liqok else 'liquidez aceitável mas apertada' if liqw else 'liquidez baixa — risco de dificuldade financeira'}",
+        1, 1, 0.4 if liqw else 0)
+
+    # 7. Endividamento — 0.00 significa dado não capturado, tratar como neutro
+    if div_p == 0:
+        add("Endividamento (Dív/Patrim.)",
+            "warn", "N/D",
+            "Dados de endividamento não disponíveis. Verifique o balanço diretamente.",
+            1, 0, 0.5)
+    else:
+        endok = div_p < 0.5; endw = div_p < 1.5
+        add("Endividamento (Dív/Patrim.)",
+            "pass" if endok else "warn" if endw else "fail",
+            f"{div_p:.2f}x",
+            f"Dívida/Patrimônio {div_p:.2f}x — {'endividamento controlado' if endok else 'endividamento moderado' if endw else 'endividamento elevado — risco relevante'}",
+            1, 1, 0.5 if endw else 0)
+
+    # 8. vs IBOV — só pontua se tiver dado real de variação
+    if var_a == 0 and var_i == 0:
+        add("Performance vs IBOV", "warn", "N/D",
+            "Variação mensal indisponível no momento. Consulte cotações em tempo real.",
+            0.5, 0, 0.25)
+    else:
+        ibovok = var_a > var_i; ibovw = abs(var_a - var_i) < 1
+        add("Performance vs IBOV",
+            "pass" if ibovok else "warn" if ibovw else "fail",
+            f"{'+' if var_a >= 0 else ''}{var_a:.1f}% vs {'+' if var_i >= 0 else ''}{var_i:.1f}%",
+            f"{'Superou o Ibovespa em' if ibovok else 'Ficou próximo,' if ibovw else 'Ficou abaixo,'} {abs(var_a-var_i):.1f} p.p. no mês",
+            0.5, 0.5, 0.2 if ibovw else 0)
+
+    # 9. vs IPCA — só pontua se tiver dado real
+    if var_a == 0:
+        add("Performance vs IPCA", "warn", "N/D",
+            "Variação mensal indisponível. Dado necessário para comparação com inflação.",
+            0.5, 0, 0.25)
+    else:
+        ipcaok = var_a > ipca / 12
+        add("Performance vs IPCA",
+            "pass" if ipcaok else "fail",
+            f"Ação {var_a:.1f}% / IPCA {ipca/12:.2f}%/mês",
+            f"{'Preservou poder de compra no período' if ipcaok else 'Rendeu abaixo da inflação no mês'}",
+            0.5, 0.5)
+
+    score = round(pts / mx * 100) if mx > 0 else 0
+    return score, cr
+
+
+# ─── Análise textual local (sem IA externa) ───────────────────────────────────
+def gerar_analise(d, pj, score, tipo):
+    ticker  = d.get("ticker", "")
+    empresa = d.get("empresa", ticker)
+    setor   = d.get("setor", "—")
+    if not setor or setor == "—":
+        setor = TICKER_SETOR_MAP.get(ticker, "—")
+    preco   = d.get("preco", 0)
+    pl      = d.get("pl", 0)
+    pvp     = d.get("pvp", 0)
+    roe     = d.get("roe", 0)
+    dy      = d.get("dy", 0)
+    marg_l  = d.get("marg_liq", 0)
+    div_p   = d.get("div_patrim", 0)
+    cresc5  = d.get("cresc_5a", 0)
+    media   = pj.get("media", 0)
+    mg      = pj.get("margem", 0)
+
+    # Empresa e setor
+    txt_empresa = f"{empresa} ({ticker}) atua no setor de {setor}. "
+    if roe >= 15:
+        txt_empresa += f"A empresa demonstra alta rentabilidade com ROE de {roe:.1f}%, indicando boa geração de valor sobre o capital dos acionistas."
+    elif roe >= 8:
+        txt_empresa += f"Apresenta rentabilidade moderada com ROE de {roe:.1f}%."
+    else:
+        txt_empresa += f"O ROE de {roe:.1f}% indica dificuldade em rentabilizar o capital próprio — ponto de atenção relevante."
+
+    # Avaliação de preço
+    if media > 0:
+        if mg >= 25:
+            txt_preco = f"Com preço atual de R$ {preco:.2f} e valor justo médio estimado em R$ {media:.2f}, a ação negocia com desconto de {mg:.1f}%. "
+            txt_preco += f"O P/L de {pl:.1f}x e P/VP de {pvp:.2f}x reforçam a atratividade dos múltiplos no momento."
+        elif mg >= 0:
+            txt_preco = f"O preço de R$ {preco:.2f} está próximo do valor justo estimado de R$ {media:.2f} (desconto de apenas {mg:.1f}%). "
+            txt_preco += "A margem de segurança é baixa — o ativo está próximo do seu preço justo."
+        else:
+            txt_preco = f"Com preço atual de R$ {preco:.2f} acima do valor justo estimado de R$ {media:.2f} ({abs(mg):.1f}% de prêmio), "
+            txt_preco += "o investidor estaria pagando acima do valor intrínseco calculado pelos modelos quantitativos."
+    else:
+        txt_preco = f"Preço atual: R$ {preco:.2f}. Dados insuficientes para calcular valor justo pelos modelos."
+
+    # Pontos de atenção
+    alertas = []
+    if div_p > 1.0: alertas.append(f"endividamento elevado ({div_p:.2f}x patrimônio)")
+    if marg_l < 5 and marg_l > 0: alertas.append(f"margem líquida apertada ({marg_l:.1f}%)")
+    if cresc5 < 0: alertas.append(f"receita em queda nos últimos 5 anos ({cresc5:.1f}%)")
+    if dy < 2 and dy > 0: alertas.append(f"dividend yield baixo ({dy:.1f}%)")
+    if pl > 20: alertas.append(f"P/L elevado ({pl:.1f}x)")
+
+    if alertas:
+        txt_atencao = "Pontos que merecem monitoramento: " + "; ".join(alertas) + ". Recomenda-se verificar os balanços mais recentes antes de tomar qualquer decisão."
+    else:
+        txt_atencao = "Os indicadores quantitativos não apontam alertas críticos. A empresa apresenta fundamentos equilibrados nos critérios analisados."
+
+    # Perspectiva
+    if score >= 65:
+        txt_persp = f"Com pontuação de {score}% nos critérios fundamentalistas, o ativo apresenta características favoráveis para o investidor de longo prazo. A combinação de múltiplos atrativos e margem de segurança positiva sugere potencial de valorização."
+    elif score >= 40:
+        txt_persp = f"Pontuação de {score}% — o ativo está em zona neutra. Pode ser interessante monitorar e aguardar um ponto de entrada mais favorável ou uma melhora nos fundamentos."
+    else:
+        txt_persp = f"Pontuação de {score}% indica que os fundamentos atuais não justificam o preço pedido. Não necessariamente uma empresa ruim — apenas o momento de entrada pode não ser o mais adequado."
+
+    return {
+        "empresa":     txt_empresa,
+        "preco":       txt_preco,
+        "atencao":     txt_atencao,
+        "perspectiva": txt_persp,
+    }
+
+
+
+def analisar_qualitativa(ticker, empresa, setor, dados):
+    """Análise qualitativa local — 5 critérios baseados nos dados disponíveis"""
+
+    roe       = dados.get("roe", 0)
+    dy        = dados.get("dy", 0)
+    marg_liq  = dados.get("marg_liq", 0)
+    cresc_5a  = dados.get("cresc_5a", 0)
+    div_patrim= dados.get("div_patrim", 0)
+    liq_corr  = dados.get("liq_corr", 0)
+    pvp       = dados.get("pvp", 0)
+    pl        = dados.get("pl", 0)
+    # Usa mapa de tickers como fallback para setor
+    if (not setor or setor == "—") and ticker in TICKER_SETOR_MAP:
+        setor = TICKER_SETOR_MAP[ticker.upper()]
+    setor_l = setor.lower() if setor and setor != "—" else ""
+
+    def nivel(nota):
+        return "FORTE" if nota >= 14 else "FRACO" if nota <= 7 else "MÉDIO"
+
+    criterios = []
+
+    # ── 1. Vantagem Competitiva (Moat) ──
+    # Proxy: ROE alto sustentado + margem alta = moat provável
+    if roe >= 20 and marg_liq >= 15:
+        n1, j1 = 17, f"ROE de {roe:.1f}% e margem líquida de {marg_liq:.1f}% sugerem vantagem competitiva relevante. Empresa consegue manter rentabilidade acima da média do mercado."
+    elif roe >= 15 and marg_liq >= 8:
+        n1, j1 = 14, f"ROE de {roe:.1f}% indica rentabilidade sólida, com alguma vantagem competitiva. Margem de {marg_liq:.1f}% é satisfatória para o setor."
+    elif roe >= 10:
+        n1, j1 = 10, f"ROE de {roe:.1f}% sugere vantagem competitiva moderada. Empresa rentável mas sem diferencial muito destacado."
+    else:
+        n1, j1 = 5, f"ROE de {roe:.1f}% indica dificuldade em manter vantagem competitiva consistente. Rentabilidade abaixo do esperado."
+    # Bônus: concessão/monopólio por setor
+    if any(x in setor_l for x in ["saneam", "energia", "elétri", "eletri", "gás", "gas", "água", "agua"]):
+        n1 = min(20, n1 + 3)
+        j1 += " Atua em setor de concessão/infraestrutura, o que confere barreira de entrada natural."
+    elif any(x in setor_l for x in ["banco", "financ"]):
+        n1 = min(20, n1 + 2)
+        j1 += " Setor bancário possui barreiras regulatórias que protegem os players estabelecidos."
+    criterios.append({"nome": "Vantagem Competitiva (Moat)", "nota": n1, "nivel": nivel(n1), "justificativa": j1})
+
+    # ── 2. Previsibilidade de Receita ──
+    if any(x in setor_l for x in ["saneam", "energia", "elétri", "eletri", "gás", "gas", "água", "agua", "telecom"]):
+        n2, j2 = 17, "Receita altamente previsível por contrato de concessão ou tarifa regulada. Fluxo de caixa estável e recorrente."
+    elif any(x in setor_l for x in ["banco", "financ", "seguro"]):
+        n2, j2 = 14, "Receita financeira tende a ser recorrente, embora sujeita a ciclos de crédito e spreads. Previsibilidade moderada-alta."
+    elif any(x in setor_l for x in ["petró", "petro", "minera", "sider", "celulose", "papel", "agro"]):
+        n2, j2 = 7, "Setor cíclico com receita atrelada a commodities. Alta volatilidade de preços reduz previsibilidade."
+    elif cresc_5a > 5 and marg_liq > 5:
+        n2, j2 = 13, f"Crescimento de receita de {cresc_5a:.1f}% ao ano sugere demanda consistente. Previsibilidade razoável."
+    else:
+        n2, j2 = 10, "Previsibilidade de receita moderada. Depende do ciclo econômico e da demanda do setor."
+    criterios.append({"nome": "Previsibilidade de Receita", "nota": n2, "nivel": nivel(n2), "justificativa": j2})
+
+    # ── 3. Gestão e Governança ──
+    # Proxy: DY consistente + crescimento = gestão alocando bem capital
+    if dy >= 5 and cresc_5a > 0 and div_patrim < 1.0:
+        n3, j3 = 16, f"Dividend yield de {dy:.1f}% com crescimento positivo e endividamento controlado sugerem gestão disciplinada na alocação de capital."
+    elif dy >= 3 and div_patrim < 1.5:
+        n3, j3 = 13, f"Pagamento de dividendos de {dy:.1f}% e endividamento moderado indicam gestão financeira responsável."
+    elif div_patrim > 2.0:
+        n3, j3 = 6, f"Endividamento elevado ({div_patrim:.1f}x patrimônio) pode indicar gestão agressiva ou necessidade de capital. Ponto de atenção relevante."
+    else:
+        n3, j3 = 10, "Governança aparentemente adequada, sem sinais claros de má alocação de capital nos dados disponíveis."
+    criterios.append({"nome": "Gestão e Governança", "nota": n3, "nivel": nivel(n3), "justificativa": j3})
+
+    # ── 4. Posição no Setor ──
+    # Proxy: margem + ROE acima da média = posição de destaque
+    if roe >= 18 and marg_liq >= 12:
+        n4, j4 = 17, f"ROE de {roe:.1f}% e margem de {marg_liq:.1f}% sugerem posição de liderança ou destaque no setor. Empresa captura valor acima dos concorrentes."
+    elif roe >= 12 and marg_liq >= 6:
+        n4, j4 = 13, f"Indicadores de {roe:.1f}% ROE e {marg_liq:.1f}% de margem indicam posição competitiva sólida no setor."
+    elif roe >= 8:
+        n4, j4 = 9, f"ROE de {roe:.1f}% indica posição intermediária no setor. Empresa competitiva mas sem grande diferencial."
+    else:
+        n4, j4 = 5, f"ROE de {roe:.1f}% sugere posição fraca no setor ou fase de reestruturação. Monitorar evolução dos resultados."
+    criterios.append({"nome": "Posição no Setor", "nota": n4, "nivel": nivel(n4), "justificativa": j4})
+
+    # ── 5. Risco Regulatório/Político ──
+    if any(x in setor_l for x in ["saneam", "energia", "elétri", "eletri", "gás", "gas", "água", "agua"]):
+        n5, j5 = 10, "Setor regulado oferece estabilidade tarifária mas expõe a empresa a revisões de concessão e interferência política. Risco moderado."
+    elif any(x in setor_l for x in ["banco", "financ"]):
+        n5, j5 = 11, "Setor bancário é fortemente regulado pelo Banco Central, o que garante estabilidade mas também impõe restrições operacionais."
+    elif any(x in setor_l for x in ["petró", "petro", "minera"]):
+        n5, j5 = 8, "Setor sujeito a royalties, regulação ambiental e interferência governamental. Risco regulatório/político relevante."
+    elif any(x in setor_l for x in ["saúde", "saude", "pharma", "farm"]):
+        n5, j5 = 9, "Setor sujeito a regulação da ANVISA e políticas de saúde pública. Risco moderado mas gerenciável."
+    else:
+        n5, j5 = 14, "Setor com baixa exposição regulatória direta. Risco político/regulatório controlado para o perfil da empresa."
+    criterios.append({"nome": "Risco Regulatório/Político", "nota": n5, "nivel": nivel(n5), "justificativa": j5})
+
+    score_qual = n1 + n2 + n3 + n4 + n5
+
+    # ── Resumo ──
+    pontos_fortes = [c["nome"] for c in criterios if c["nota"] >= 14]
+    pontos_fracos = [c["nome"] for c in criterios if c["nota"] <= 7]
+
+    if score_qual >= 70:
+        resumo = f"{empresa} apresenta perfil qualitativo sólido (score {score_qual}/100). "
+        resumo += f"Destaca-se em: {', '.join(pontos_fortes)}. " if pontos_fortes else ""
+        resumo += "Para o investidor de longo prazo, a combinação de fundamentos qualitativos e quantitativos favoráveis representa uma oportunidade interessante de alocação."
+    elif score_qual >= 50:
+        resumo = f"{empresa} apresenta perfil qualitativo equilibrado (score {score_qual}/100). "
+        resumo += f"Pontos fortes: {', '.join(pontos_fortes)}. " if pontos_fortes else ""
+        resumo += f"Pontos de atenção: {', '.join(pontos_fracos)}. " if pontos_fracos else ""
+        resumo += "Empresa adequada para investidores que buscam equilíbrio entre risco e retorno."
+    else:
+        resumo = f"{empresa} apresenta perfil qualitativo com pontos de atenção relevantes (score {score_qual}/100). "
+        resumo += f"Principais fragilidades: {', '.join(pontos_fracos)}. " if pontos_fracos else ""
+        resumo += "Recomenda-se análise mais aprofundada dos balanços antes de qualquer decisão de investimento."
+
+    return {
+        "criterios": criterios,
+        "score_qualitativo": score_qual,
+        "resumo": resumo
+    }
+
+
+# ─── Contextos Setoriais ─────────────────────────────────────────────────────
+# Influência do dólar por setor: 'positivo', 'negativo', 'neutro'
+DOLAR_INFLUENCIA = {
+    "concessoes":  ("neutro",   "Impacto neutro — receitas em BRL, insumos parcialmente importados."),
+    "portos":      ("positivo", "Dólar alto aumenta volume e receita de exportações em reais."),
+    "bancos":      ("neutro",   "Impacto indireto — dólar alto pressiona tomadores de crédito em USD."),
+    "agro":        ("positivo", "Commodities cotadas em USD — dólar alto eleva receita em reais."),
+    "energia":     ("negativo", "Equipamentos importados e dívidas em USD encarecem com dólar alto."),
+    "saneamento":  ("negativo", "Insumos e equipamentos importados ficam mais caros."),
+    "varejo":      ("negativo", "Produtos importados encarecem, pressionando margens e consumo."),
+    "logistica":   ("negativo", "Veículos, peças e equipamentos importados sobem com dólar."),
+    "mineracao":   ("positivo", "Minério e metais cotados em USD — dólar alto eleva receita em reais."),
+    "petroleo":    ("positivo", "Petróleo cotado em USD — dólar alto beneficia receitas em reais."),
+    "construcao":  ("negativo", "Aço, cobre e equipamentos importados encarecem."),
+    "saude":       ("negativo", "Medicamentos e equipamentos médicos importados ficam mais caros."),
+    "telecom":     ("negativo", "Infraestrutura e equipamentos de tecnologia importados sobem."),
+}
+
+CONTEXTOS_SETORIAIS = {
+    "concessoes": {
+        "nome": "Concessões Rodoviárias",
+        "status": "FAVORÁVEL",
+        "cor": "verde",
+        "emoji": "🟢",
+        "keywords": ["concess","rodov","autopista","pedágio","pedagio","autoestrada"],
+        "texto": "Superciclo de concessões em curso. Pipeline de R$148bi em leilões previstos para 2026, com 13-14 novos contratos. Selic em queda gradual reduz custo de capital das concessionárias. Dólar alto favorece corredores de exportação. Risco: atrasos em leilões e pressão de insumos (asfalto, mão de obra)."
+    },
+    "portos": {
+        "nome": "Portos / Hidrovias",
+        "status": "FAVORÁVEL",
+        "cor": "verde",
+        "emoji": "🟢",
+        "keywords": ["porto","hidrovia","terminal","navegação","navegacao","logíst","logist","transporte aquav"],
+        "texto": "Safra 2025/26 acima da média histórica impulsiona movimentação portuária. Pico de escoamento de soja e milho entre janeiro e maio. Dólar elevado aumenta receita em reais das operações ligadas à exportação. Risco: congestionamento operacional e dependência climática."
+    },
+    "bancos": {
+        "nome": "Bancos / Financeiro",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["banco","financ","crédito","credito","seguro","capital","previdên","previdenc"],
+        "texto": "Crédito rural aquecido com safra forte, mas Selic ainda elevada pressiona inadimplência pessoa física e PMEs. Spread bancário sustentado. LCA e CPR com alta demanda. Bancos públicos com exposição maior ao risco político. Risco: deterioração fiscal e aumento de calotes no agro em caso de queda de preços de commodities."
+    },
+    "agro": {
+        "nome": "Agro / Commodities Agrícolas",
+        "status": "FAVORÁVEL",
+        "cor": "verde",
+        "emoji": "🟢",
+        "keywords": ["agro","agrícol","agricol","aliment","grão","grao","soja","milho","cana","açúcar","acucar","frigoríf","frigorif","proteína","proteina","maquina","máquina","equipamento","implemento"],
+        "texto": "Safra 2025/26 de soja projetada entre 165-170 milhões de toneladas. Dólar acima de R$5,40 favorece exportadores. Preços internacionais de milho e soja em patamar sustentável. Atenção ao La Niña residual no Sul e ao impacto de tarifas americanas no fluxo global de grãos. Momento positivo para produtores e empresas do agro."
+    },
+    "energia": {
+        "nome": "Energia Elétrica",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["energ","elétric","electric","geraç","geracao","transmiss","distribui","eólica","eolica","solar","hidrelét","hidrelet"],
+        "texto": "Reservatórios em nível adequado após chuvas do verão. Geração hídrica normalizada reduz pressão sobre térmicas e tarifas. Revisões tarifárias da ANEEL em curso para distribuidoras. Expansão de energia solar e eólica pressiona margens de transmissoras tradicionais. Risco: estiagem no segundo semestre e interferência tarifária política."
+    },
+    "saneamento": {
+        "nome": "Saneamento",
+        "status": "FAVORÁVEL",
+        "cor": "verde",
+        "emoji": "🟢",
+        "keywords": ["saneam","água","agua","esgoto","resíduo","residuo","ambiental"],
+        "texto": "Marco Legal do Saneamento acelerando privatizações e concessões. Meta de universalização até 2033 exige R$700bi em investimentos. Pipeline robusto de leilões estaduais e municipais. Selic em queda beneficia financiamento de longo prazo. Risco: execução lenta por parte dos municípios e judicialização de contratos."
+    },
+    "varejo": {
+        "nome": "Varejo",
+        "status": "PRESSÃO",
+        "cor": "vermelho",
+        "emoji": "🔴",
+        "keywords": ["varejo","comercio","comércio","supermercado","vestuário","vestuario","moda","farmácia","farmacia","eletrônic","eletronic","e-commerce"],
+        "texto": "Inflação de alimentos pressionando poder de compra das famílias de baixa renda. Juros do rotativo ainda elevados limitam consumo. Inadimplência do consumidor acima da média histórica. Programas sociais sustentam consumo mínimo mas não impulsionam crescimento. Risco: piora fiscal e corte de transferências governamentais."
+    },
+    "logistica": {
+        "nome": "Logística / Galpões",
+        "status": "FAVORÁVEL",
+        "cor": "verde",
+        "emoji": "🟢",
+        "keywords": ["galpão","galpao","armazém","armazem","logíst","logist","distribui","fulfillment","multimodal"],
+        "texto": "E-commerce e agro sustentam alta demanda por galpões logísticos de alto padrão. Taxa de vacância em mínimas históricas nas regiões Sul e Sudeste. Expansão para o Centro-Oeste acompanhando o agro. Dólar alto encarece construção (aço, equipamentos importados). Risco: desaceleração do e-commerce e oversupply em regiões secundárias."
+    },
+    "mineracao": {
+        "nome": "Mineração",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["miner","siderurgi","metalurgi","ferro","aço","aco","alumínio","aluminio","cobre","níquel","niquel"],
+        "texto": "Preço do minério de ferro pressionado pela demanda chinesa abaixo do esperado. Cobre e níquel com perspectiva positiva pela transição energética global. Dólar alto favorece receitas em reais mas custos operacionais sobem. Risco: desaceleração da China, regulação ambiental crescente e instabilidade em regiões de extração."
+    },
+    "petroleo": {
+        "nome": "Petróleo / Petroquímica",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["petróleo","petroleo","petroquím","petroquim","refinaria","combustív","combustiv","óleo","oleo","gás","gas natural"],
+        "texto": "Preço do Brent em faixa de US$70-80, sustentado por cortes da OPEP+ mas pressionado por crescimento global moderado. Petrobras com geração de caixa robusta e dividendos elevados. Risco político de interferência na política de preços e dividendos. Downstream pressionado por margens de refino apertadas e concorrência de importados."
+    },
+    "construcao": {
+        "nome": "Construção Civil / Imóveis",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["constru","imóvel","imovel","incorpora","habitaç","habitac","shopping","real estate","edifica"],
+        "texto": "Programa Minha Casa Minha Vida aquecido no segmento econômico. Alto padrão pressionado por juros elevados e distrato. Custo de construção (INCC) ainda acima da inflação. Vacância em shoppings estável. Risco: Selic alta prolongada e desaceleração do crédito imobiliário."
+    },
+    "saude": {
+        "nome": "Saúde",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["saúde","saude","hospital","clínica","clinica","diagnóst","diagnost","pharma","farmacêut","farmaceut","plano de saúde","plano de saude"],
+        "texto": "Setor defensivo com demanda resiliente. Inflação médica (IPCA saúde) persistente pressiona custos de operadoras. Regulação da ANS em revisão. Telemedicina e diagnósticos digitais avançando. Risco: sinistralidade elevada em planos de saúde e concentração de mercado atraindo atenção regulatória."
+    },
+    "telecom": {
+        "nome": "Telecomunicações",
+        "status": "NEUTRO",
+        "cor": "amarelo",
+        "emoji": "🟡",
+        "keywords": ["telecom","telefon","comunicaç","comunicac","internet","fibra","5g","banda larga","tv por assinatura"],
+        "texto": "Expansão de fibra óptica e 5G mantém investimentos elevados. Consolidação do setor reduz competição e sustenta ARPU. Demanda corporativa por conectividade cresce com digitalização. Risco: regulação da Anatel, inadimplência de clientes pessoa física e custo de espectro."
+    },
+}
+
+# Mapa manual de tickers → setor (fallback quando Fundamentus não retorna setor)
+TICKER_SETOR_MAP = {
+    # Petróleo
+    "PETR4":"Petróleo e Gás","PETR3":"Petróleo e Gás","RECV3":"Petróleo e Gás",
+    "PRIO3":"Petróleo e Gás","RRRP3":"Petróleo e Gás","CSAN3":"Petróleo e Gás",
+    # Mineração
+    "VALE3":"Mineração","CSNA3":"Siderurgia","GGBR4":"Siderurgia","USIM5":"Siderurgia",
+    "BRAP4":"Mineração","CBAV3":"Mineração","CMIN3":"Mineração",
+    # Bancos
+    "ITUB4":"Bancos","ITUB3":"Bancos","BBDC4":"Bancos","BBDC3":"Bancos",
+    "BBAS3":"Bancos","SANB4":"Bancos","SANB3":"Bancos","SANB11":"Bancos",
+    "BRSR6":"Bancos","BPAC11":"Bancos","ABCB4":"Bancos","BMGB4":"Bancos",
+    # Energia
+    "EGIE3":"Energia Elétrica","ENGI11":"Energia Elétrica","TAEE11":"Energia Elétrica",
+    "CPFE3":"Energia Elétrica","CMIG4":"Energia Elétrica","CMIG3":"Energia Elétrica",
+    "ELET3":"Energia Elétrica","ELET6":"Energia Elétrica","AURE3":"Energia Elétrica",
+    "CPLE6":"Energia Elétrica","CESP6":"Energia Elétrica","TRPL4":"Energia Elétrica",
+    "ENEV3":"Energia Elétrica","EQTL3":"Energia Elétrica","NEOE3":"Energia Elétrica",
+    # Saneamento
+    "SAPR4":"Saneamento","SAPR3":"Saneamento","SAPR11":"Saneamento",
+    "SBSP3":"Saneamento","CSMG3":"Saneamento","FESA4":"Saneamento",
+    # Concessões Rodoviárias
+    "ECOR3":"Concessões Rodoviárias","CCRO3":"Concessões Rodoviárias",
+    "TIMS3":"Concessões Rodoviárias","RDNI3":"Concessões Rodoviárias",
+    # Portos / Hidrovias / Transporte
+    "HBSA3":"Transporte Hidroviário","TPIS3":"Transporte Hidroviário",
+    "LOGN3":"Logística","RAIL3":"Logística","JSLG3":"Logística",
+    "TGMA3":"Logística","VAMO3":"Logística","POMO4":"Logística",
+    # Agro
+    "SLCE3":"Agronegócio","AGRO3":"Agronegócio","SMTO3":"Agronegócio",
+    "TTEN3":"Agronegócio","CAML3":"Agronegócio","BEEF3":"Agronegócio",
+    "MRFG3":"Agronegócio","JBSS3":"Agronegócio","BRFS3":"Agronegócio",
+    "MFRG3":"Agronegócio","CSLT3":"Agronegócio",
+    # Varejo
+    "MGLU3":"Varejo","VIIA3":"Varejo","AMER3":"Varejo","LREN3":"Varejo",
+    "HGTX3":"Varejo","SOMA3":"Varejo","ALPA4":"Varejo","CEAB3":"Varejo",
+    "PCAR3":"Varejo Alimentar","ASAI3":"Varejo Alimentar","CRFB3":"Varejo Alimentar",
+    # Saúde
+    "RDOR3":"Saúde","HAPV3":"Saúde","GNDI3":"Saúde","FLRY3":"Saúde",
+    "DASA3":"Saúde","QUAL3":"Saúde","PARD3":"Saúde","ONCO3":"Saúde",
+    # Telecom
+    "VIVT3":"Telecomunicações","TIMS3":"Telecomunicações","OIBR3":"Telecomunicações",
+    # Construção
+    "MRVE3":"Construção Civil","CYRE3":"Construção Civil","EVEN3":"Construção Civil",
+    "EZTC3":"Construção Civil","DIRR3":"Construção Civil","TEND3":"Construção Civil",
+    "MULT3":"Shopping","IGTI11":"Shopping","BRML3":"Shopping",
+    # Papel/Celulose
+    "SUZB3":"Papel e Celulose","KLBN11":"Papel e Celulose","RANI3":"Papel e Celulose",
+    # Máquinas e Equipamentos Agrícolas
+    "WEGE3":"Máquinas Industriais","WEGE":"Máquinas Industriais","KEPL3":"Máquinas Agrícolas","RAIN3":"Máquinas Agrícolas","FRAS3":"Máquinas Agrícolas",
+    "AGXY3":"Máquinas Agrícolas","RCSL4":"Máquinas Agrícolas",
+    # Transportes diversos
+    "AZUL4":"Transporte Aéreo","GOLL4":"Transporte Aéreo","EMBR3":"Aeronáutico",
+    "RENT3":"Locação de Veículos","MOVI3":"Locação de Veículos","VAMO3":"Locação de Veículos",
+    # Tecnologia
+    "TOTS3":"Tecnologia","LWSA3":"Tecnologia","POSI3":"Tecnologia","INTB3":"Tecnologia",
+    "CASH3":"Tecnologia","IFCM3":"Tecnologia","DESK3":"Tecnologia",
+    # Seguros
+    "BBSE3":"Seguros","IRBR3":"Seguros","PSSA3":"Seguros","SULA11":"Seguros",
+    # FIIs Logística
+    "XPLG11":"Logística","HGLG11":"Logística","BRCO11":"Logística","LVBI11":"Logística",
+}
+
+def detectar_contexto_setor(setor, ticker=""):
+    """Detecta o contexto setorial baseado no setor da empresa"""
+    # Fallback: usar mapa de tickers se setor não disponível
+    setor_efetivo = setor
+    if (not setor or setor == "—") and ticker:
+        setor_efetivo = TICKER_SETOR_MAP.get(ticker.upper(), "—")
+    if not setor_efetivo or setor_efetivo == "—":
+        return None
+    setor_l = setor_efetivo.lower()
+    # Remove acentos para comparação
+    setor_norm = setor_l
+    for a, b in [("ã","a"),("â","a"),("á","a"),("à","a"),("é","e"),("ê","e"),
+                 ("í","i"),("ó","o"),("ô","o"),("õ","o"),("ú","u"),("ç","c")]:
+        setor_norm = setor_norm.replace(a, b)
+
+    for key, ctx in CONTEXTOS_SETORIAIS.items():
+        for kw in ctx["keywords"]:
+            kw_norm = kw
+            for a, b in [("ã","a"),("â","a"),("á","a"),("à","a"),("é","e"),("ê","e"),
+                         ("í","i"),("ó","o"),("ô","o"),("õ","o"),("ú","u"),("ç","c")]:
+                kw_norm = kw_norm.replace(a, b)
+            if kw_norm in setor_norm:
+                result = dict(ctx)
+                dolar_info = DOLAR_INFLUENCIA.get(key, ("neutro", "Impacto do dólar não mapeado para este setor."))
+                result["dolar_tipo"] = dolar_info[0]
+                result["dolar_texto"] = dolar_info[1]
+                return result
+    return None
+
+# ─── Servidor HTTP ────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(f"  → {args[1]}")
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type",  "application/json; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        p = urlparse(self.path)
+
+        # Serve o frontend
+        if p.path in ("/", "/index.html"):
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type",   "text/html; charset=utf-8")
+            self.send_header("Content-Length",  len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # API de análise
+        if p.path == "/analisar":
+            ticker = parse_qs(p.query).get("ticker", [""])[0].strip().upper()
+            if not ticker:
+                self.send_json({"erro": "Ticker não informado"}, 400)
+                return
+            try:
+                print(f"\n🔍 Analisando {ticker}...")
+
+                # 1. Fundamentus (dados principais)
+                d = buscar_fundamentus(ticker)
+
+                # Só rejeita se a página veio vazia (ticker realmente não existe)
+                # _html_valido=False significa que o HTML tinha menos de 1000 chars
+                # ou continha "Nenhum papel encontrado"
+                if d.get("_pagina_invalida"):
+                    self.send_json({"erro": f"Ticker '{ticker}' não encontrado. Verifique se está correto."})
+                    return
+
+                # 2. Investidor10 (dados complementares)
+                extra = buscar_investidor10(ticker)
+                # Complementa com média quando Fundamentus não trouxe
+                for campo_i10, campo_fund in [("pl_i10","pl"),("dy_i10","dy"),("roe_i10","roe")]:
+                    if extra.get(campo_i10) and d.get(campo_fund, 0) == 0:
+                        d[campo_fund] = extra[campo_i10]
+                if extra.get("payout"):    d["payout"]      = extra["payout"]
+                if extra.get("cresc_lucro"): d["cresc_lucro"] = extra["cresc_lucro"]
+
+                # 3. Variações de mercado
+                d["var_mes"]      = buscar_var(f"{ticker}.SA")
+                d["var_ibov_mes"] = buscar_var("%5EBVSP")
+                d["ipca_12m"]     = buscar_ipca()
+                d["dolar"]        = buscar_dolar()
+
+                # 4. Tipo de empresa — usa setor real ou mapa de tickers
+                setor_raw = d.get("setor", "")
+                if not setor_raw or setor_raw == "—":
+                    setor_raw = TICKER_SETOR_MAP.get(ticker, "")
+                setor_low = setor_raw.lower()
+                # ── Perfil da empresa: valor / crescimento / dividendos / banco / util / cicl ──
+                roe_val    = d.get("roe", 0)
+                dy_val     = d.get("dy", 0)
+                pl_val     = d.get("pl", 0)
+                cresc_val  = d.get("cresc_5a", 0)
+
+                if any(x in setor_low for x in ["banco","financ","seguro","crédit","credito"]):
+                    tipo = "banco"
+                elif any(x in setor_low for x in ["energia","elétri","eletri","saneam","água","agua","gás","gas","concess","rodovi","ferrovi"]):
+                    tipo = "util"
+                elif any(x in setor_low for x in ["petró","petro","minera","sider","celulose","papel","metalur"]):
+                    tipo = "cicl"
+                elif roe_val >= 20 and pl_val > 18:
+                    # ROE alto sustentado + mercado paga prêmio = CRESCIMENTO
+                    # (não depende de cresc_5a que frequentemente vem zerado do Fundamentus)
+                    tipo = "cresc"
+                elif dy_val >= 6 and pl_val < 15:
+                    # Alto DY + múltiplo baixo = foco em dividendos
+                    tipo = "div"
+                elif pl_val < 12 and d.get("pvp", 0) < 1.2:
+                    # Múltiplos muito baixos = valor puro
+                    tipo = "valor"
+                else:
+                    tipo = "geral"
+
+                # Perfil label para exibição no frontend
+                perfil_labels = {
+                    "banco":  ("🏦", "BANCO/FINANCEIRO",  "Avaliado por ROE, P/VP e qualidade da carteira"),
+                    "util":   ("⚡", "UTILIDADE/CONCESSÃO","Avaliado por DY, estabilidade e P/L regulado"),
+                    "cicl":   ("⛏",  "CÍCLICO/COMMODITY",  "Avaliado com cautela em múltiplos — lucro varia com ciclo"),
+                    "cresc":  ("🚀", "CRESCIMENTO",         "Avaliado por ROE, crescimento e qualidade — P/L alto é esperado"),
+                    "div":    ("💰", "DIVIDENDOS",          "Avaliado por DY sustentável, Bazin e previsibilidade"),
+                    "valor":  ("💎", "VALOR",               "Avaliado por margem de segurança e múltiplos baixos"),
+                    "geral":  ("📊", "GERAL",               "Análise padrão equilibrada"),
+                }
+                perfil_info = perfil_labels.get(tipo, perfil_labels["geral"])
+
+                # 5. Crescimento estimado (usa dados reais se disponível)
+                cresc_raw = d.get("cresc_lucro", d.get("cresc_5a", 5)) or 5
+                # Cap de crescimento por tipo: cíclicas e petróleo limitam a 8%
+                if tipo in ("cicl",):
+                    cresc = max(2, min(8, cresc_raw))
+                elif tipo == "banco":
+                    cresc = max(3, min(12, cresc_raw))
+                else:
+                    cresc = max(3, min(20, cresc_raw))
+
+                # 6. Preço justo
+                pj = calcular_preco_justo(d, cresc, tipo)
+
+                # 7. Score e critérios
+                score, criterios = calcular_score(d, pj, tipo)
+
+                # 8. Análise textual
+                analise = gerar_analise(d, pj, score, tipo)
+
+                # 9. Análise qualitativa via Claude API
+                print(f"  🤖 Gerando análise qualitativa...")
+                qualitativa = analisar_qualitativa(
+                    ticker,
+                    d.get("empresa", ticker),
+                    d.get("setor", "—"),
+                    d
+                )
+
+                print(f"  ✅ R${d['preco']:.2f} | P/L {d['pl']:.1f}x | ROE {d['roe']:.1f}% | Score {score}%")
+
+                self.send_json({
+                    "ticker":  ticker,
+                    "empresa": d.get("empresa", ticker),
+                    "setor":   d.get("setor", "—"),
+                    "dados": {
+                        "preco":       d.get("preco", 0),
+                        "pl":          d.get("pl", 0),
+                        "pvp":         d.get("pvp", 0),
+                        "roe":         d.get("roe", 0),
+                        "dy":          d.get("dy", 0),
+                        "lpa":         d.get("lpa", 0),
+                        "vpa":         d.get("vpa", 0),
+                        "dividendo12m":d.get("dividendo12m", 0),
+                        "var_mes":     d.get("var_mes", 0),
+                        "var_ibov_mes":d.get("var_ibov_mes", 0),
+                        "ipca_12m":    d.get("ipca_12m", 0),
+                        "dolar":       d.get("dolar", 0),
+                        "marg_liq":    d.get("marg_liq", 0),
+                        "div_patrim":  d.get("div_patrim", 0),
+                    },
+                    "precos_justos": pj,
+                    "score":         score,
+                    "criterios":     criterios,
+                    "analise":       analise,
+                    "qualitativa":   qualitativa,
+                    "contexto_setor": detectar_contexto_setor(d.get("setor","—"), ticker),
+                    "perfil":         {"tipo": tipo, "emoji": perfil_info[0], "label": perfil_info[1], "desc": perfil_info[2]},
+                    "score_final":    round(score * 0.6 + qualitativa.get("score_qualitativo", 0) * 0.4, 1),
+                    "preco_alvo":     pj.get("media", 0),
+                    "sinal":          (
+                        "compra" if score >= 70 and pj.get("margem", 0) > -5 else
+                        "compra" if score >= 65 and pj.get("margem", 0) > 10 else
+                        "evitar" if score < 45 else
+                        "evitar" if pj.get("margem", 0) < -25 else
+                        "neutro"
+                    ),
+                    "setor_detectado": d.get("setor","—") if d.get("setor","—") != "—" else TICKER_SETOR_MAP.get(ticker.upper(),"—"),
+                    "ticker":         ticker.upper(),
+                })
+
+            except URLError as e:
+                self.send_json({"erro": f"Erro de conexão: {e}. Verifique sua internet."})
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.send_json({"erro": f"Erro ao processar {ticker}: {str(e)}"})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("\n" + "="*52)
+    print("  📊  QUANTTECH VALOR JUSTO")
+    print("="*52)
+    print(f"  ✅  Sem necessidade de chave de API")
+    print(f"  ✅  Dados reais automaticamente")
+    print(f"  ✅  Fundamentus + Investidor10 + IPCA")
+    print(f"  🌐  Acesse: http://localhost:{PORT}")
+    print("="*52)
+    print("  Pressione Ctrl+C para encerrar\n")
+
+    server = HTTPServer(("localhost", PORT), Handler)
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Encerrado. Até logo!")
