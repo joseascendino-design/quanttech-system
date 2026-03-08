@@ -2173,5 +2173,17 @@ def iniciar():
     except KeyboardInterrupt:
         print("\n  Encerrado.")
 
+# Compatibilidade com Gunicorn (Railway)
+class _AppWSGI:
+    def __call__(self, environ, start_response):
+        start_response('200 OK', [('Content-Type', 'text/plain')])
+        return [b'OK']
+
+app = _AppWSGI()
+
 # Roda tanto via `python app.py` quanto via Gunicorn
-iniciar()
+if __name__ == '__main__':
+    iniciar()
+else:
+    import threading
+    threading.Thread(target=iniciar, daemon=True).start()
